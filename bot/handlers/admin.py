@@ -12,6 +12,7 @@ import logging
 from database import db as database
 from database.db import get_all_users, DB_PATH
 from services.panel_api import PanelAPI
+from services.subscription_link import reissue_subscription_link
 from config.config import PANEL_API_URL, PANEL_API_KEY, ADMIN_ID
 
 router = Router()
@@ -80,19 +81,22 @@ class ReduceDays(StatesGroup):
     confirm = State()
 
 
+class RevokeLink(StatesGroup):
+    user_id = State()
+    subscription_id = State()
+    confirm = State()
+
+
 # ======================================================
 # АДМИН-МЕНЮ
 # ======================================================
 
-@router.message(Command("admin"))
-async def admin_menu(message: Message):
-    if not await database.is_admin(message.from_user.id):
-        return
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+def admin_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Управление тарифами", callback_data="admin_tariffs")],
         [InlineKeyboardButton(text="➕ Добавить дни подписки", callback_data="admin_add_days")],
         [InlineKeyboardButton(text="➖ Уменьшить дни подписки", callback_data="admin_reduce_days")],
+        [InlineKeyboardButton(text="🔗 Перевыпустить ссылку", callback_data="admin_revoke_link")],
         [InlineKeyboardButton(text="💾 Управление бэкапами", callback_data="admin_backup")],
         [InlineKeyboardButton(text="👑 Добавить администратора", callback_data="admin_add_admin")],
         [InlineKeyboardButton(text="🎟 Промокоды", callback_data="admin_promos")],
@@ -101,6 +105,25 @@ async def admin_menu(message: Message):
         [InlineKeyboardButton(text="✅ Разбанить пользователя", callback_data="admin_unban_user")],
         [InlineKeyboardButton(text="📋 Список администраторов", callback_data="admin_list")]
     ])
+
+
+async def show_admin_menu(callback: CallbackQuery, notice: str = None):
+    """Вернуть сообщение к админ-меню (после отмены операции)"""
+    text = "🛠 <b>Админ-панель</b>\nВыберите действие:"
+    try:
+        await callback.message.edit_text(text, reply_markup=admin_menu_keyboard(), parse_mode="HTML")
+    except Exception:
+        # Сообщение с медиа (например, превью рассылки) в текст не превратить — отправляем новое
+        await callback.message.answer(text, reply_markup=admin_menu_keyboard(), parse_mode="HTML")
+    await callback.answer(notice)
+
+
+@router.message(Command("admin"))
+async def admin_menu(message: Message):
+    if not await database.is_admin(message.from_user.id):
+        return
+
+    kb = admin_menu_keyboard()
 
     await message.answer(
         "🛠 <b>Админ-панель</b>\nВыберите действие:",
@@ -1386,16 +1409,7 @@ async def choose_mailing_audience(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "cancel_mailing")
 async def cancel_mailing(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    # Создаем искусственный callback для возврата в админ-меню
-    fake_callback = types.CallbackQuery(
-        id="0",
-        from_user=callback.from_user,
-        chat_instance="0",
-        message=callback.message,
-        data="admin_back"
-    )
-    await back_to_admin(fake_callback)
-    await callback.answer("✅ Рассылка отменена")
+    await show_admin_menu(callback, "✅ Рассылка отменена")
 
 
 @router.message(Mailing.content)
@@ -1830,18 +1844,7 @@ async def back_to_admin(callback: CallbackQuery):
         await callback.answer("❌ Нет прав", show_alert=True)
         return
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📦 Управление тарифами", callback_data="admin_tariffs")],
-        [InlineKeyboardButton(text="➕ Добавить дни подписки", callback_data="admin_add_days")],
-        [InlineKeyboardButton(text="➖ Уменьшить дни подписки", callback_data="admin_reduce_days")],
-        [InlineKeyboardButton(text="💾 Управление бэкапами", callback_data="admin_backup")],
-        [InlineKeyboardButton(text="👑 Добавить администратора", callback_data="admin_add_admin")],
-        [InlineKeyboardButton(text="🎟 Промокоды", callback_data="admin_promos")],
-        [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_mailing")],
-        [InlineKeyboardButton(text="🚫 Забанить пользователя", callback_data="admin_ban_user")],
-        [InlineKeyboardButton(text="✅ Разбанить пользователя", callback_data="admin_unban_user")],
-        [InlineKeyboardButton(text="📋 Список администраторов", callback_data="admin_list")]
-    ])
+    kb = admin_menu_keyboard()
 
     await callback.message.edit_text(
         "🛠 <b>Админ-панель</b>\nВыберите действие:",
@@ -2064,17 +2067,7 @@ async def confirm_reduce_days(callback: CallbackQuery, state: FSMContext):
 
     if action == "no":
         await state.clear()
-        # Возвращаемся в админ-меню
-        fake_callback = types.CallbackQuery(
-            id="0",
-            from_user=callback.from_user,
-            chat_instance="0",
-            message=callback.message,
-            data="admin_back"
-        )
-        from admin import back_to_admin
-        await back_to_admin(fake_callback)
-        await callback.answer("✅ Операция отменена")
+        await show_admin_menu(callback, "✅ Операция отменена")
         return
 
     # action == "yes"
@@ -2182,14 +2175,155 @@ async def confirm_reduce_days(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "confirm_reduce_no")
 async def cancel_reduce(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    # Возвращаемся в админ-меню
-    fake_callback = types.CallbackQuery(
-        id="0",
-        from_user=callback.from_user,
-        chat_instance="0",
-        message=callback.message,
-        data="admin_back"
+    await show_admin_menu(callback, "✅ Операция отменена")
+
+# ======================================================
+# ПЕРЕВЫПУСК ССЫЛКИ ПОДПИСКИ (без ограничения по времени)
+# ======================================================
+
+@router.callback_query(F.data == "admin_revoke_link")
+async def start_revoke_link(callback: CallbackQuery, state: FSMContext):
+    if not await database.is_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет прав администратора", show_alert=True)
+        return
+
+    await state.set_state(RevokeLink.user_id)
+    await callback.message.answer(
+        "1️⃣ Введите <b>Telegram ID</b> пользователя, которому нужно перевыпустить ссылку:",
+        parse_mode="HTML"
     )
-    from admin import back_to_admin
-    await back_to_admin(fake_callback)
-    await callback.answer("✅ Операция отменена")
+    await callback.answer()
+
+
+@router.message(RevokeLink.user_id)
+async def process_revoke_user_id(message: Message, state: FSMContext):
+    if not await database.is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    if not message.text or not message.text.isdigit():
+        await message.answer("❌ Введите корректный Telegram ID!")
+        return
+
+    user_id = int(message.text)
+    if not await database.get_user(user_id):
+        await message.answer("❌ Пользователь не найден в базе данных")
+        await state.clear()
+        return
+
+    subscriptions = await database.get_user_subscriptions(user_id)
+    if not subscriptions:
+        await message.answer("❌ У пользователя нет подписок")
+        await state.clear()
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(
+            text=f"{sub['tariff_name']} (до {(sub['subscription_expiry'] or 'нет даты')[:10]})",
+            callback_data=f"admin_revoke_sub_{sub['id']}"
+        )]
+        for sub in subscriptions
+    ]
+    keyboard.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_revoke_cancel")])
+
+    await state.update_data(user_id=user_id)
+    await state.set_state(RevokeLink.subscription_id)
+    await message.answer(
+        f"👤 Найден пользователь ID: {user_id}\n\n"
+        f"2️⃣ Выберите подписку для перевыпуска ссылки:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+
+
+@router.callback_query(RevokeLink.subscription_id, F.data.startswith("admin_revoke_sub_"))
+async def process_revoke_subscription_select(callback: CallbackQuery, state: FSMContext):
+    if not await database.is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    subscription_id = int(callback.data.split("_")[3])
+    data = await state.get_data()
+    subscription = await database.get_subscription(subscription_id)
+    if not subscription or subscription['telegram_id'] != data.get('user_id'):
+        await callback.answer("❌ Подписка не найдена", show_alert=True)
+        return
+
+    await state.update_data(subscription_id=subscription_id)
+    await state.set_state(RevokeLink.confirm)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Перевыпустить", callback_data="admin_revoke_confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="admin_revoke_cancel")
+        ]
+    ])
+    await callback.message.edit_text(
+        f"⚠️ <b>Перевыпуск ссылки</b>\n\n"
+        f"👤 Пользователь ID: <code>{subscription['telegram_id']}</code>\n"
+        f"📦 Подписка: {subscription['tariff_name']}\n"
+        f"🔑 Username в панели: <code>{subscription['username_in_panel']}</code>\n\n"
+        f"Старая ссылка перестанет работать, VPN отключится на всех устройствах пользователя. "
+        f"Новая ссылка будет отправлена ему в бот.",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(RevokeLink.confirm, F.data == "admin_revoke_confirm")
+async def confirm_admin_revoke_link(callback: CallbackQuery, state: FSMContext):
+    if not await database.is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав", show_alert=True)
+        return
+
+    data = await state.get_data()
+    await state.clear()
+
+    subscription = await database.get_subscription(data.get('subscription_id'))
+    if not subscription:
+        await callback.answer("❌ Подписка не найдена", show_alert=True)
+        return
+
+    await callback.message.edit_text("⏳ Перевыпускаю ссылку...")
+
+    # Админ перевыпускает без ограничения и не расходует суточный лимит пользователя
+    link = await reissue_subscription_link(panel_api, subscription)
+    if not link:
+        await callback.message.edit_text(
+            "❌ Не удалось перевыпустить ссылку в панели.\n"
+            f"Username в панели: <code>{subscription['username_in_panel']}</code>",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    try:
+        await callback.bot.send_message(
+            subscription['telegram_id'],
+            f"🔗 <b>Ссылка подписки перевыпущена</b>\n\n"
+            f"📦 Подписка: {subscription['tariff_name']}\n\n"
+            f"Старая ссылка больше не работает. Новая ссылка для подключения:\n"
+            f"{link}\n\n"
+            f"💡 <i>Удалите старую подписку из приложения и добавьте эту.</i>",
+            parse_mode="HTML"
+        )
+        notify_status = "✅ Новая ссылка отправлена пользователю"
+    except Exception as e:
+        notify_status = f"❌ Не удалось отправить пользователю: {e}"
+
+    await callback.message.edit_text(
+        f"✅ <b>Ссылка перевыпущена</b>\n\n"
+        f"👤 Пользователь ID: <code>{subscription['telegram_id']}</code>\n"
+        f"📦 Подписка: {subscription['tariff_name']}\n"
+        f"🔗 Новая ссылка:\n{link}\n\n"
+        f"{notify_status}",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_revoke_cancel")
+async def cancel_admin_revoke_link(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("✅ Перевыпуск ссылки отменён")
+    await callback.answer()

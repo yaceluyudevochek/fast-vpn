@@ -11,6 +11,7 @@ from config.config import PANEL_API_URL, PANEL_API_KEY
 from database import db as database
 from database import promo_db
 from services.promo import normalize_code
+from services.subscription_link import reissue_subscription_link
 from handlers.payment import router as payment_router
 from handlers.ui_screens import show_screen
 from handlers.ui_emoji import E, BTN, kb_button
@@ -783,6 +784,7 @@ async def view_subscription(callback: CallbackQuery):
 
     if info and info['is_active']:
         keyboard.append([kb_button("reset", "Сбросить лимит устройств", callback_data=f"reset_devices_{subscription_id}")])
+        keyboard.append([kb_button("link", "Перевыпустить ссылку", callback_data=f"revoke_link_{subscription_id}")])
 
     keyboard.append([kb_button(
         "buy", "Продлить подписку",
@@ -889,13 +891,21 @@ async def render_renew_plan(target, user_id: int, plan_id: int, subscription_id:
 # СБРОС УСТРОЙСТВ ДЛЯ КОНКРЕТНОЙ ПОДПИСКИ
 # ==========================================================
 
+async def _own_subscription(callback: CallbackQuery, subscription_id: int):
+    """Подписка, если она принадлежит нажавшему; иначе показывает ошибку и возвращает None"""
+    subscription = await database.get_subscription(subscription_id)
+    if not subscription or subscription['telegram_id'] != callback.from_user.id:
+        await callback.answer("❌ Подписка не найдена", show_alert=True)
+        return None
+    return subscription
+
+
 @router.callback_query(F.data.startswith("reset_devices_"))
 async def reset_devices(callback: CallbackQuery):
     subscription_id = int(callback.data.split("_")[2])
 
-    subscription = await database.get_subscription(subscription_id)
+    subscription = await _own_subscription(callback, subscription_id)
     if not subscription:
-        await callback.answer("❌ Подписка не найдена", show_alert=True)
         return
 
     # Проверяем, можно ли сбросить
@@ -929,9 +939,8 @@ async def reset_devices(callback: CallbackQuery):
 async def confirm_reset_devices(callback: CallbackQuery):
     subscription_id = int(callback.data.split("_")[2])
 
-    subscription = await database.get_subscription(subscription_id)
+    subscription = await _own_subscription(callback, subscription_id)
     if not subscription:
-        await callback.answer("❌ Подписка не найдена", show_alert=True)
         return
 
     # Еще раз проверяем
@@ -971,6 +980,84 @@ async def confirm_reset_devices(callback: CallbackQuery):
             InlineKeyboardMarkup(inline_keyboard=[
                 [kb_button("back", "Назад", callback_data=f"view_sub_{subscription_id}")]
             ])
+        )
+    await callback.answer()
+
+
+# ==========================================================
+# ПЕРЕВЫПУСК ССЫЛКИ ПОДПИСКИ (раз в сутки)
+# ==========================================================
+
+@router.callback_query(F.data.startswith("revoke_link_"))
+async def revoke_link(callback: CallbackQuery):
+    subscription_id = int(callback.data.split("_")[2])
+
+    subscription = await _own_subscription(callback, subscription_id)
+    if not subscription:
+        return
+
+    can_revoke, message = await database.can_revoke_link(subscription_id)
+    if not can_revoke:
+        await callback.answer(message, show_alert=True)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            kb_button("confirm", "Да, перевыпустить", callback_data=f"confirm_revoke_{subscription_id}"),
+            kb_button("cancel", "Отмена", callback_data=f"view_sub_{subscription_id}")
+        ]
+    ])
+
+    text = (
+        f"{E['warn']} <b>Подтверди перевыпуск ссылки</b>\n\n"
+        f"Подписка: <b>{subscription['tariff_name']}</b>\n\n"
+        "Будет создана новая ссылка подписки. Старая ссылка перестанет работать, "
+        "а на всех устройствах VPN отключится — новую ссылку нужно будет "
+        "заново добавить в приложение.\n\n"
+        "Используй это, если ссылка попала к посторонним.\n\n"
+        f"{E['clock']} Перевыпуск доступен <b>1 раз в сутки</b>."
+    )
+
+    await show_screen(callback, "subs", text, keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("confirm_revoke_"))
+async def confirm_revoke_link(callback: CallbackQuery):
+    subscription_id = int(callback.data.split("_")[2])
+
+    subscription = await _own_subscription(callback, subscription_id)
+    if not subscription:
+        return
+
+    # Ещё раз проверяем: могли нажать "Да" дважды или открыть старое сообщение
+    can_revoke, message = await database.can_revoke_link(subscription_id)
+    if not can_revoke:
+        await callback.answer(message, show_alert=True)
+        return
+
+    await show_screen(callback, "subs", f"{E['clock']} Перевыпускаю ссылку...")
+
+    link = await reissue_subscription_link(panel_api, subscription)
+    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [kb_button("back", "Назад к подписке", callback_data=f"view_sub_{subscription_id}")]
+    ])
+
+    if link:
+        await database.record_link_revoke(subscription_id)
+        text = (
+            f"{E['check']} <b>Ссылка перевыпущена!</b>\n\n"
+            f"{E['diamond']} Подписка: <b>{subscription['tariff_name']}</b>\n\n"
+            f"{E['link']} <b>Новая ссылка для подключения:</b>\n"
+            f"{link}\n\n"
+            f"{E['bulb']} <i>Удали старую подписку из приложения и добавь эту.</i>"
+        )
+        await show_screen(callback, "subs", text, back_keyboard)
+    else:
+        await show_screen(
+            callback, "subs",
+            f"{E['cross']} Не удалось перевыпустить ссылку. Попробуй позже или напиши в поддержку.",
+            back_keyboard
         )
     await callback.answer()
 

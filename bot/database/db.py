@@ -201,11 +201,24 @@ async def _m004_promo_codes(db):
     await _add_column(db, "payment_transactions", "original_amount", "INTEGER")
 
 
+async def _m005_link_revokes(db):
+    """Перевыпуск ссылки подписки пользователем (не чаще раза в сутки)"""
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS link_revokes (
+            subscription_id INTEGER PRIMARY KEY,
+            last_revoke TIMESTAMP,
+            revoke_count INTEGER DEFAULT 0,
+            FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
+        )
+    """)
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
     (3, _m003_trial_nudge),
     (4, _m004_promo_codes),
+    (5, _m005_link_revokes),
 ]
 
 
@@ -696,6 +709,24 @@ async def set_trial_nudge_status(subscription_id: int, status: str):
 # DEVICE RESET FUNCTIONS (обновленные)
 # ======================================================
 
+def _daily_cooldown(last_iso: Optional[str], action: str) -> tuple[bool, str]:
+    """Действие доступно раз в 24 часа. Возвращает (можно ли, сообщение о времени ожидания)"""
+    if not last_iso:
+        return True, ""
+
+    time_diff = datetime.now() - datetime.fromisoformat(last_iso)
+    if time_diff.total_seconds() >= 24 * 60 * 60:
+        return True, ""
+
+    hours_left = 24 - (time_diff.total_seconds() / 3600)
+    hours = int(hours_left)
+    minutes = int((hours_left - hours) * 60)
+
+    if hours > 0:
+        return False, f"⏳ {action} будет доступен через {hours} ч. {minutes} мин."
+    return False, f"⏳ {action} будет доступен через {minutes} мин."
+
+
 async def can_reset_devices(subscription_id: int) -> tuple[bool, str]:
     """
     Проверяет, можно ли сбросить устройства для конкретной подписки
@@ -706,27 +737,7 @@ async def can_reset_devices(subscription_id: int) -> tuple[bool, str]:
                 (subscription_id,)
         ) as cursor:
             row = await cursor.fetchone()
-
-            if not row or not row[0]:
-                return True, ""
-
-            last_reset = datetime.fromisoformat(row[0])
-            now = datetime.now()
-
-            time_diff = now - last_reset
-            if time_diff.total_seconds() >= 24 * 60 * 60:
-                return True, ""
-            else:
-                hours_left = 24 - (time_diff.total_seconds() / 3600)
-                hours = int(hours_left)
-                minutes = int((hours_left - hours) * 60)
-
-                if hours > 0:
-                    wait_message = f"⏳ Следующий сброс будет доступен через {hours} ч. {minutes} мин."
-                else:
-                    wait_message = f"⏳ Следующий сброс будет доступен через {minutes} мин."
-
-                return False, wait_message
+            return _daily_cooldown(row[0] if row else None, "Следующий сброс")
 
 
 async def record_device_reset(subscription_id: int):
@@ -763,6 +774,44 @@ async def get_last_reset_info(subscription_id: int) -> dict:
                 "last_reset": None,
                 "reset_count": 0
             }
+
+
+# ======================================================
+# ПЕРЕВЫПУСК ССЫЛКИ ПОДПИСКИ
+# ======================================================
+
+async def can_revoke_link(subscription_id: int) -> tuple[bool, str]:
+    """Можно ли пользователю перевыпустить ссылку подписки (раз в 24 часа; админ — без ограничения)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+                "SELECT last_revoke FROM link_revokes WHERE subscription_id = ?",
+                (subscription_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return _daily_cooldown(row[0] if row else None, "Следующий перевыпуск")
+
+
+async def record_link_revoke(subscription_id: int):
+    """Записать время перевыпуска ссылки пользователем"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO link_revokes (subscription_id, last_revoke, revoke_count)
+            VALUES (?, ?, 1) ON CONFLICT(subscription_id) DO
+            UPDATE SET
+                last_revoke = excluded.last_revoke,
+                revoke_count = revoke_count + 1
+        """, (subscription_id, datetime.now().isoformat()))
+        await db.commit()
+
+
+async def update_subscription_short_uuid(subscription_id: int, short_uuid: str):
+    """После перевыпуска ссылки у пользователя в панели новый shortUuid"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE subscriptions SET short_uuid = ? WHERE id = ?",
+            (short_uuid, subscription_id)
+        )
+        await db.commit()
 
 
 # ======================================================

@@ -305,6 +305,36 @@ class PanelAPI:
 
         return False
 
+    # ======================================================
+    # ПЕРЕВЫПУСК ССЫЛКИ ПОДПИСКИ
+    # ======================================================
+
+    async def revoke_subscription_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        """
+        Перевыпустить подписку: POST /api/users/{id}/actions/revoke.
+        Панель генерирует новый shortUuid (ссылка меняется) и новые ключи —
+        старая ссылка и уже импортированные по ней конфиги перестают работать.
+        Возвращает обновлённого пользователя (shortUuid, subscriptionUrl) или None.
+        """
+        user = await self.get_user_by_username(username)
+        if not user:
+            logger.error(f"❌ User {username} not found in panel")
+            return None
+
+        user_id = user.get("id")
+        if not user_id:
+            logger.error(f"❌ User {username} has no ID")
+            return None
+
+        response = await self._request("POST", f"users/{user_id}/actions/revoke", json={})
+
+        if response and not response.get("error") and "response" in response:
+            logger.info(f"🔗 Subscription revoked for {username}, new shortUuid: {response['response'].get('shortUuid')}")
+            return response["response"]
+
+        logger.error(f"❌ Failed to revoke subscription for {username}: {response}")
+        return None
+
     async def close(self):
         if self._session:
             await self._session.close()
