@@ -172,7 +172,8 @@ async def admin_bs_check(callback: CallbackQuery):
         await whitelist.notify_users(callback.bot, result)
         note = (
             f"Проверено. Выдан: {len(result.added)}, снят: {len(result.removed)}, "
-            f"исчерпали лимит: {len(result.exhausted)}, вернулись: {len(result.restored)}"
+            f"исчерпали лимит: {len(result.exhausted)}, вернулись: {len(result.restored)}, "
+            f"предупреждены (осталось < 20%): {len(result.warned)}"
         )
     text, keyboard = await _bs_menu()
     await callback.message.edit_text(f"{note}\n\n{text}", reply_markup=keyboard, parse_mode="HTML")

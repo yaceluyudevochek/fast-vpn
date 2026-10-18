@@ -270,6 +270,11 @@ async def _fill_bs_paid_until(db):
                          (value.strftime("%Y-%m-%d %H:%M:%S"), sub_id))
 
 
+async def _m007_whitelist_warning(db):
+    """Предупреждение «осталось 20% лимита белых списков»: для какой квоты уже отправлено"""
+    await _add_column(db, "subscriptions", "bs_warned_period", "TEXT")
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -277,6 +282,7 @@ _MIGRATIONS = [
     (4, _m004_promo_codes),
     (5, _m005_link_revokes),
     (6, _m006_whitelist),
+    (7, _m007_whitelist_warning),
 ]
 
 
@@ -915,13 +921,13 @@ def _sql_ts(moment: datetime) -> str:
     return moment.strftime("%Y-%m-%d %H:%M:%S")
 
 
-async def add_bs_paid_days(subscription_id: int, days: int, now: datetime, from_now: bool = False,
-                           restart_period: bool = False):
+async def add_bs_paid_days(subscription_id: int, days: int, now: datetime, from_now: bool = False):
     """
     Оплаченные дни (оплата или дни от админа): продлевают bs_paid_until.
-    Период БС начинается заново при оплате (restart_period) или если до этого оплаченных дней не было.
+    Досрочное продление (оплаченные дни ещё идут) только добавляет дни — 30-дневный период
+    и уже потраченный в нём трафик не сбрасываются. Если оплаченных дней не было (триал,
+    бонусы, оплаченный срок истёк) — оплаченный период начинается с этого момента.
     from_now — срок считается от текущего момента (лимитные тарифы: остаток сгорает, как и в панели).
-    Исчерпанный лимит и ручное «без лимита» сбрасываются; «отключено админом» остаётся.
     """
     subscription = await get_subscription(subscription_id)
     if not subscription:
@@ -933,16 +939,20 @@ async def add_bs_paid_days(subscription_id: int, days: int, now: datetime, from_
     was_paid = paid_until is not None and paid_until > now
     base = now if (from_now or not was_paid) else paid_until
     old_anchor = subscription.get("bs_period_anchor")
-    anchor = now if (restart_period or not was_paid or not old_anchor) else datetime.fromisoformat(old_anchor)
+    anchor = datetime.fromisoformat(old_anchor) if (was_paid and old_anchor) else now
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            UPDATE subscriptions
-            SET bs_paid_until = ?, bs_period_anchor = ?,
-                bs_state = CASE WHEN bs_state = 'admin_off' THEN bs_state END,
-                bs_state_period = CASE WHEN bs_state = 'admin_off' THEN bs_state_period END
-            WHERE id = ?
-        """, (_sql_ts(base + timedelta(days=days)), _sql_ts(anchor), subscription_id))
+        await db.execute(
+            "UPDATE subscriptions SET bs_paid_until = ?, bs_period_anchor = ? WHERE id = ?",
+            (_sql_ts(base + timedelta(days=days)), _sql_ts(anchor), subscription_id)
+        )
+        await db.commit()
+
+
+async def set_bs_warned(subscription_id: int, quota_key: str):
+    """Предупреждение «осталось 20%» отправлено для этой квоты"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE subscriptions SET bs_warned_period = ? WHERE id = ?", (quota_key, subscription_id))
         await db.commit()
 
 

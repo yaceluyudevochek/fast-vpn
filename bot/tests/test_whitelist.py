@@ -217,7 +217,7 @@ async def test_check_all():
     texts = dict(bot.sent)
     assert sorted(texts) == [2, 3]
     assert "после оплаты подписки" in texts[2]         # неоплаченные дни: вернётся только после оплаты
-    assert "или сразу после продления" in texts[3]    # оплаченные: обновится через 30 дней
+    assert "вернётся <b>" in texts[3] and "продлен" not in texts[3]   # оплаченные: обновится по расписанию
 
     again = await whitelist.check_all(panel, NOW)
     assert again.added == [] and again.removed == [] and again.exhausted == [] and again.restored == []
@@ -245,7 +245,7 @@ async def test_question_referral_days_then_payment():
     q = whitelist.get_quota(await sub(sid), NOW)
     assert not q.paid and q.limit == 3 * GB
 
-    await db.add_bs_paid_days(sid, 30, NOW, restart_period=True)   # оплатил 30 дней
+    await db.add_bs_paid_days(sid, 30, NOW)   # оплатил 30 дней: оплаченных дней не было — период с момента оплаты
     q = whitelist.get_quota(await sub(sid), NOW + timedelta(days=1))
     assert q.paid and q.limit == 50 * GB and q.start == NOW and q.refresh_at == NOW + timedelta(days=30)
     panel.use(101, NOW + timedelta(days=1), 45)                  # 45 ГБ в оплаченные дни
@@ -295,18 +295,31 @@ async def test_payment_and_admin():
     await whitelist.check_all(panel)
     assert state(path, c) == "exhausted"
 
-    # Продление безлимитного плана: оплаченные дни складываются, период начинается заново, сквад сразу возвращается
-    before = (await sub(c))["bs_paid_until"]
+    # Досрочное продление безлимитного плана: дни складываются, но период и потраченный трафик не сбрасываются
+    before = await sub(c)
     await whitelist.on_payment(panel, 3, {"tariff_type_id": 1, "days": 30, "traffic_limit_bytes": 0})
     s = await sub(c)
-    assert state(path, c) is None and BS in panel.squads("c")
-    assert datetime.fromisoformat(s["bs_paid_until"]) == datetime.fromisoformat(before) + timedelta(days=30)
-    assert datetime.fromisoformat(s["bs_period_anchor"]) > utcnow() - timedelta(minutes=5)
+    assert datetime.fromisoformat(s["bs_paid_until"]) == datetime.fromisoformat(before["bs_paid_until"]) + timedelta(days=30)
+    assert s["bs_period_anchor"] == before["bs_period_anchor"]
+    assert state(path, c) == "exhausted" and BS not in panel.squads("c")
+    result = await whitelist.check_all(panel)
+    assert result.added == [] and result.restored == [] and BS not in panel.squads("c")
 
-    # Лимитный план: срок от текущего момента (остаток сгорает, как и в панели)
+    # Лимитный план: срок от текущего момента (остаток сгорает, как и в панели), период тоже не сбрасывается
     await whitelist.on_payment(panel, 3, {"tariff_type_id": 1, "days": 30, "traffic_limit_bytes": 100 * GB})
-    paid_until = datetime.fromisoformat((await sub(c))["bs_paid_until"])
-    assert abs(paid_until - (utcnow() + timedelta(days=30))) < timedelta(minutes=5)
+    s = await sub(c)
+    assert abs(datetime.fromisoformat(s["bs_paid_until"]) - (utcnow() + timedelta(days=30))) < timedelta(minutes=5)
+    assert s["bs_period_anchor"] == before["bs_period_anchor"]
+
+    # Неплативший исчерпал разовые 3 ГБ и оплатил — полный лимит сразу, сквад возвращается без ожидания проверки
+    u = await make_sub(path, 8, "unpaid", anchor=NOW - timedelta(days=40))
+    panel.add("unpaid", 108); panel.use(108, datetime.now(timezone.utc), 4)
+    await whitelist.check_all(panel)
+    assert state(path, u) == "exhausted" and BS not in panel.squads("unpaid")
+    await whitelist.on_payment(panel, 8, {"tariff_type_id": 1, "days": 30, "traffic_limit_bytes": 0})
+    assert state(path, u) is None and BS in panel.squads("unpaid")
+    q = whitelist.get_quota(await sub(u))
+    assert q.paid and q.limit == 50 * GB and q.start > datetime.now(timezone.utc) - timedelta(minutes=5)
 
     # Админ отключил БС — проверка и оплата не возвращают
     assert await whitelist.admin_set_user_squad(panel, await sub(c), BS, False)
@@ -346,10 +359,43 @@ async def test_payment_and_admin():
     # Отключить у всех: снимается у всех, у кого есть (и у не-ботов), другие сквады остаются
     panel.add("friend", 999, squads=(ADMIN_SQUAD, BS))
     removed = await whitelist.disable_for_all(panel)
-    assert removed == 3 and BS not in panel.squads("c") and panel.squads("friend") == [ADMIN_SQUAD]
+    assert removed == 4 and BS not in panel.squads("c") and panel.squads("friend") == [ADMIN_SQUAD]
     assert not await whitelist.is_enabled()
-    print("OK  оплата и админ: дни складываются, лимитный план — от текущего момента, admin_off/admin_on, "
+    print("OK  оплата и админ: досрочное продление не обновляет лимит, первая оплата — сразу полный лимит, "
+          "лимитный план — от текущего момента, admin_off/admin_on, "
           "дни от админа = полный лимит, уменьшение дней, «отключить у всех»")
+
+
+async def test_warning():
+    path = await fresh_db()
+    panel = FakePanel()
+    now = datetime.now(timezone.utc)
+    p = await make_sub(path, 1, "paid", anchor=now - timedelta(days=5), paid_until=now + timedelta(days=60))
+    panel.add("paid", 101); panel.use(101, now, 42)                # 42 из 50 — осталось 8 ГБ
+    short = await make_sub(path, 2, "short", anchor=now - timedelta(days=5), paid_until=now + timedelta(days=3))
+    panel.add("short", 102); panel.use(102, now, 41)               # оплаченные дни кончатся раньше обновления
+    u = await make_sub(path, 3, "unpaid", anchor=now - timedelta(days=5))
+    panel.add("unpaid", 103); panel.use(103, now, 2.5)             # 2.5 из 3
+    await make_sub(path, 4, "calm", paid_until=now + timedelta(days=60))
+    panel.add("calm", 104); panel.use(104, now, 10)                # 10 из 50 — не предупреждаем
+
+    result = await whitelist.check_all(panel)
+    assert sorted(s["telegram_id"] for s, _ in result.warned) == [1, 2, 3]
+    assert result.exhausted == [] and all(BS in panel.squads(n) for n in ("paid", "short", "unpaid", "calm"))
+    bot = FakeBot()
+    await whitelist.notify_users(bot, result)
+    texts = dict(bot.sent)
+    assert "осталось 8 из 50 ГБ" in texts[1] and "Лимит обновится" in texts[1] and "продлить" not in texts[1]
+    assert "если продлить подписку" in texts[2]
+    assert "осталось 0.5 из 3 ГБ" in texts[3] and "Оплати подписку" in texts[3] and "50 ГБ" in texts[3]
+
+    # Повторно в той же квоте не предупреждаем, исчерпание — отдельное уведомление
+    again = await whitelist.check_all(panel)
+    assert again.warned == []
+    panel.use(101, now, 10)
+    again = await whitelist.check_all(panel)
+    assert again.warned == [] and [s["telegram_id"] for s in again.exhausted] == [1]
+    print("OK  предупреждение «осталось 20%»: один раз на квоту; тексты — когда обновится, «если продлить», «оплати подписку»")
 
 
 async def test_status_text():
@@ -423,6 +469,7 @@ async def main():
     await test_question_referral_days_then_payment()
     await test_question_referral_farmer()
     await test_payment_and_admin()
+    await test_warning()
     await test_status_text()
     await test_migration()
 
