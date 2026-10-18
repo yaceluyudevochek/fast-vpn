@@ -134,11 +134,11 @@ async def activate_transaction(transaction) -> bool:
     finally:
         if activated:
             await db.mark_activated(transaction_id)
-            # Белые списки: оплата начинает новый 30-дневный период лимита
+            # Белые списки: дни плана становятся оплаченными, период лимита начинается заново
             try:
                 plan = await db.get_tariff_plan(transaction['plan_id'])
                 if plan:
-                    await whitelist.on_payment(panel_api, transaction['telegram_id'], plan['tariff_type_id'])
+                    await whitelist.on_payment(panel_api, transaction['telegram_id'], plan)
             except Exception as e:
                 logger.error(f"❌ Не удалось обновить период белых списков по транзакции {transaction_id}: {e}")
             # Промокод считается применённым только после оплаты и активации подписки
@@ -380,7 +380,7 @@ async def handle_successful_payment(transaction) -> bool:
                     tag=tag,
                     traffic_limit_bytes=plan['traffic_limit_bytes'],
                     extra_squad_ids=await whitelist.squads_for_new_user(
-                        await db.get_tariff_type(plan['tariff_type_id']), user_id
+                        await db.get_tariff_type(plan['tariff_type_id'])
                     )
                 )
 

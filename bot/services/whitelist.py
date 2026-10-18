@@ -5,16 +5,21 @@
   сквады, например админский, не трогает и их трафик не считает).
 - Трафик считается панелью по всем нодам сквада (серверов БС может быть несколько).
 - Лимит — у типа тарифа (tariff_types.bs_limit_gb, NULL = БС не входит в тариф).
-  Полный лимит — только тем, кто хоть раз оплатил подписку; остальным (триал) — BS_TRIAL_LIMIT_GB.
-- Период — 30 дней от покупки (subscriptions.bs_period_anchor), оплата начинает период заново.
-- Лимит исчерпан → сквад БС у пользователя снимается до конца периода, потом возвращается.
-- Глобальный выключатель (bot_settings.bs_enabled): выключено — бот никому не выдаёт сквад БС.
 
-bs_state у подписки:
+Квота зависит от того, оплачены ли текущие дни подписки (subscriptions.bs_paid_until):
+- оплаченные дни (оплата или дни от админа) — полный лимит тарифа, обновляется
+  каждые 30 дней от покупки (subscriptions.bs_period_anchor);
+- неоплаченные дни (триал, бонусы за рефералов, дни после окончания оплаченного
+  срока) — разовый пул BS_TRIAL_LIMIT_GB на всё время, пополняется только оплатой.
+
+Лимит исчерпан → сквад БС у пользователя снимается до обновления квоты, потом возвращается.
+Глобальный выключатель (bot_settings.bs_enabled): выключено — бот никому не выдаёт сквад БС.
+
+bs_state у подписки (bs_state_period — ключ квоты, к которой относится состояние):
   NULL       — по умолчанию: сквад есть, пока не исчерпан лимит;
-  exhausted  — лимит исчерпан в периоде bs_state_period, сквад снят;
+  exhausted  — лимит исчерпан, сквад снят до смены квоты;
   admin_off  — админ отключил БС вручную, бот сам не вернёт;
-  admin_on   — админ включил вручную: без лимита до конца периода bs_state_period.
+  admin_on   — админ включил вручную: без лимита до смены квоты.
 """
 import asyncio
 import logging
@@ -50,17 +55,17 @@ async def set_enabled(enabled: bool):
 
 
 # ======================================================
-# ПЕРИОД И ЛИМИТ
+# КВОТА
 # ======================================================
 
-def _parse_utc(value: Optional[str]) -> Optional[datetime]:
+def _parse_utc(value) -> Optional[datetime]:
     if not value:
         return None
-    moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    moment = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
-def current_period(anchor: Optional[str], now: Optional[datetime] = None) -> Tuple[datetime, datetime]:
+def current_period(anchor, now: Optional[datetime] = None) -> Tuple[datetime, datetime]:
     """Текущий 30-дневный период, отсчитанный от anchor: (начало, момент обновления лимита)"""
     now = now or datetime.now(timezone.utc)
     start = _parse_utc(anchor) or now
@@ -69,16 +74,41 @@ def current_period(anchor: Optional[str], now: Optional[datetime] = None) -> Tup
     return start, start + timedelta(days=PERIOD_DAYS)
 
 
-def period_key(start: datetime) -> str:
-    return start.strftime("%Y-%m-%d %H:%M:%S")
+def _key(prefix: str, moment: datetime) -> str:
+    return f"{prefix}:{moment.strftime('%Y-%m-%d %H:%M:%S')}"
 
 
-def limit_bytes(subscription: Dict[str, Any], has_paid: bool) -> Optional[int]:
-    """Лимит БС для подписки в байтах; None — БС подписке не положены"""
-    if not has_paid:
-        return int(trial_limit_gb() * GB)
+@dataclass
+class Quota:
+    limit: Optional[int]           # байты; None — БС подписке не положены
+    paid: bool                     # оплаченные дни (полный лимит) или разовый пул
+    start: Optional[datetime]      # с какого момента считается трафик
+    key: str                       # меняется, когда квота обновляется
+    refresh_at: Optional[datetime] = None  # оплаченные дни: когда лимит обновится
+    paid_until: Optional[datetime] = None
+
+    @property
+    def refresh_is_full(self) -> bool:
+        """Обновится ли лимит до полного (а не закончатся оплаченные дни раньше)"""
+        return bool(self.paid and self.refresh_at and self.paid_until and self.refresh_at <= self.paid_until)
+
+
+def get_quota(subscription: Dict[str, Any], now: Optional[datetime] = None) -> Quota:
+    now = now or datetime.now(timezone.utc)
     limit_gb = subscription.get("bs_limit_gb")
-    return int(limit_gb * GB) if limit_gb else None
+    if not limit_gb:
+        return Quota(limit=None, paid=False, start=None, key="none")
+    full = int(limit_gb * GB)
+
+    paid_until = _parse_utc(subscription.get("bs_paid_until"))
+    if paid_until and now < paid_until:
+        start, refresh_at = current_period(subscription.get("bs_period_anchor"), now)
+        return Quota(full, True, start, _key("paid", start), refresh_at, paid_until)
+
+    # Неоплаченные дни: разовый пул с конца оплаченного срока (или с начала триала)
+    start = paid_until or _parse_utc(subscription.get("bs_period_anchor")) \
+        or _parse_utc(subscription.get("created_at")) or now
+    return Quota(min(full, int(trial_limit_gb() * GB)), False, start, _key("free", start), None, paid_until)
 
 
 def format_gb(value: int) -> str:
@@ -90,16 +120,23 @@ def format_moment(moment: datetime) -> str:
     return moment.astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
 
 
+def _day(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).date().isoformat()
+
+
 # ======================================================
 # СТАТУС ДЛЯ ЭКРАНОВ
 # ======================================================
 
 @dataclass
 class BsStatus:
-    limit: int
+    quota: Quota
     used: Optional[int]          # None — панель не отдала статистику
-    reset_at: datetime
     state: Optional[str]
+
+    @property
+    def limit(self) -> int:
+        return self.quota.limit
 
     @property
     def remaining(self) -> Optional[int]:
@@ -116,78 +153,107 @@ async def _panel_user_id(panel_api, subscription: Dict[str, Any]) -> Optional[in
     return user["id"]
 
 
+def _effective_state(subscription: Dict[str, Any], quota: Quota) -> Optional[str]:
+    state = subscription.get("bs_state")
+    if state in ("exhausted", "admin_on") and subscription.get("bs_state_period") != quota.key:
+        return None  # квота обновилась — состояние больше не действует
+    return state
+
+
 async def get_status(panel_api, subscription: Dict[str, Any]) -> Optional[BsStatus]:
     """Статус БС подписки или None, если БС выключены глобально или не положены подписке"""
     if not await is_enabled():
         return None
-    limit = limit_bytes(subscription, await db.user_has_paid(subscription["telegram_id"]))
-    if limit is None:
+    quota = get_quota(subscription)
+    if quota.limit is None:
         return None
-
-    start, reset_at = current_period(subscription.get("bs_period_anchor"))
-    state = subscription.get("bs_state")
-    if state in ("exhausted", "admin_on") and subscription.get("bs_state_period") != period_key(start):
-        state = None  # период сменился — фоновая проверка вернёт сквад
 
     used = None
     user_id = await _panel_user_id(panel_api, subscription)
     if user_id:
         used = await panel_api.get_squad_user_usage_bytes(
-            squad_uuid(), user_id, start.date().isoformat(), datetime.now(timezone.utc).date().isoformat()
+            squad_uuid(), user_id, _day(quota.start), _day(datetime.now(timezone.utc))
         )
-    return BsStatus(limit=limit, used=used, reset_at=reset_at, state=state)
+    return BsStatus(quota=quota, used=used, state=_effective_state(subscription, quota))
+
+
+def _when_back(quota: Quota) -> str:
+    if quota.refresh_is_full:
+        return f"вернётся <b>{format_moment(quota.refresh_at)}</b> или сразу после продления подписки"
+    return "вернётся после оплаты подписки"
 
 
 def status_text(status: BsStatus, emoji: str = "🛡") -> str:
     """Строки для карточки подписки"""
+    quota = status.quota
     title = f"{emoji} Белые списки:"
     if status.state == "admin_off":
         return f"{title} <b>отключены</b>\n"
     if status.state == "admin_on":
-        return f"{title} <b>без лимита</b> до {format_moment(status.reset_at)}\n"
+        return f"{title} <b>без лимита</b>\n"
     if status.state == "exhausted" or (status.used is not None and status.used >= status.limit):
         return (
             f"{title} лимит <b>{format_gb(status.limit)} ГБ</b> исчерпан\n"
-            f"   Обычные серверы работают без ограничений. "
-            f"Доступ к белым спискам вернётся <b>{format_moment(status.reset_at)}</b>\n"
+            f"   Обычные серверы работают без ограничений. Доступ к белым спискам {_when_back(quota)}\n"
         )
+
     if status.used is None:
-        return f"{title} лимит <b>{format_gb(status.limit)} ГБ</b> (статистика временно недоступна)\n"
-    return (
-        f"{title} осталось <b>{format_gb(status.remaining)} из {format_gb(status.limit)} ГБ</b>\n"
-        f"   Лимит обновится {format_moment(status.reset_at)}\n"
-    )
+        line = f"{title} лимит <b>{format_gb(status.limit)} ГБ</b> (статистика временно недоступна)\n"
+    else:
+        line = f"{title} осталось <b>{format_gb(status.remaining)} из {format_gb(status.limit)} ГБ</b>\n"
+
+    if quota.refresh_is_full:
+        return line + f"   Лимит обновится {format_moment(quota.refresh_at)}\n"
+    if quota.paid:
+        return line + (
+            f"   Полный лимит действует по оплаченным дням (до {format_moment(quota.paid_until)}), "
+            f"дальше — {format_gb(int(trial_limit_gb() * GB))} ГБ до продления\n"
+        )
+    return line + "   Без оплаты лимит не пополняется — полный лимит каждые 30 дней после оплаты подписки\n"
 
 
 # ======================================================
 # ВЫДАЧА СКВАДА
 # ======================================================
 
-async def squads_for_new_user(tariff_type: Dict[str, Any], telegram_id: int) -> List[str]:
-    """Дополнительные сквады при создании пользователя в панели: [сквад БС], если положен"""
-    if not await is_enabled():
-        return []
-    if limit_bytes(tariff_type, await db.user_has_paid(telegram_id)) is None:
+async def squads_for_new_user(tariff_type: Dict[str, Any]) -> List[str]:
+    """Дополнительные сквады при создании пользователя в панели: [сквад БС], если БС входят в тариф"""
+    if not await is_enabled() or not tariff_type or not tariff_type.get("bs_limit_gb"):
         return []
     return [squad_uuid()]
 
 
-async def on_payment(panel_api, telegram_id: int, tariff_type_id: int):
-    """После оплаты: период БС начинается заново, сквад возвращается, если был снят за лимит"""
-    subscription = await db.get_user_subscription_by_tariff_type(telegram_id, tariff_type_id)
-    if not subscription:
-        return
-    await db.restart_bs_period(subscription["id"])
+async def _ensure_squad(panel_api, subscription_id: int):
+    """Сразу вернуть сквад БС, если он положен (не дожидаясь фоновой проверки)"""
     if not await is_enabled():
         return
-    subscription = await db.get_subscription(subscription["id"])
-    if subscription.get("bs_state") == "admin_off" or limit_bytes(subscription, True) is None:
+    subscription = await db.get_subscription(subscription_id)
+    if not subscription or subscription.get("bs_state") == "admin_off" or get_quota(subscription).limit is None:
         return
     user = await panel_api.get_user_by_username(subscription["username_in_panel"])
     if user:
         squads = [s["uuid"] for s in user.get("activeInternalSquads", [])]
         if squad_uuid() not in squads:
             await panel_api.set_user_squads(subscription["username_in_panel"], squads + [squad_uuid()])
+
+
+async def on_payment(panel_api, telegram_id: int, plan: Dict[str, Any]):
+    """Оплата: дни плана становятся оплаченными, период БС начинается заново"""
+    subscription = await db.get_user_subscription_by_tariff_type(telegram_id, plan["tariff_type_id"])
+    if not subscription:
+        return
+    await db.add_bs_paid_days(
+        subscription["id"], plan["days"], datetime.now(timezone.utc),
+        from_now=bool(plan.get("traffic_limit_bytes")),  # лимитный тариф: срок ставится от текущего момента
+        restart_period=True,
+    )
+    await _ensure_squad(panel_api, subscription["id"])
+
+
+async def on_admin_days(panel_api, subscription_id: int, days: int):
+    """Админ добавил дни — это дни полной подписки (с полным лимитом БС)"""
+    await db.add_bs_paid_days(subscription_id, days, datetime.now(timezone.utc))
+    await _ensure_squad(panel_api, subscription_id)
 
 
 async def admin_set_user_squad(panel_api, subscription: Dict[str, Any], squad: str, enable: bool) -> bool:
@@ -200,9 +266,8 @@ async def admin_set_user_squad(panel_api, subscription: Dict[str, Any], squad: s
     if not await panel_api.set_user_squads(subscription["username_in_panel"], new_squads):
         return False
     if squad == squad_uuid():
-        start, _ = current_period(subscription.get("bs_period_anchor"))
         if enable:
-            await db.set_bs_state(subscription["id"], "admin_on", period_key(start))
+            await db.set_bs_state(subscription["id"], "admin_on", get_quota(subscription).key)
         else:
             await db.set_bs_state(subscription["id"], "admin_off")
     return True
@@ -217,7 +282,7 @@ class CheckResult:
     added: List[int]
     removed: List[int]
     exhausted: List[Dict[str, Any]]   # подписки, у которых только что кончился лимит
-    restored: List[Dict[str, Any]]    # подписки, которым вернули сквад после нового периода
+    restored: List[Dict[str, Any]]    # подписки, которым вернули сквад после обновления квоты
 
 
 _check_lock = asyncio.Lock()
@@ -225,7 +290,7 @@ _check_lock = asyncio.Lock()
 
 async def check_all(panel_api, now: Optional[datetime] = None) -> Optional[CheckResult]:
     """
-    Сверить сквад БС у всех пользователей бота с лимитами и периодами и применить изменения.
+    Сверить сквад БС у всех пользователей бота с квотами и применить изменения.
     None — проверка не выполнялась (выключено или панель не ответила).
     """
     async with _check_lock:  # фоновая проверка и кнопка «Проверить сейчас» не пересекаются
@@ -244,17 +309,19 @@ async def _check_all(panel_api, now: Optional[datetime] = None) -> Optional[Chec
     by_username = {u["username"]: u for u in panel_users}
 
     subscriptions = await db.get_bs_subscriptions()
-    limits = {s["id"]: limit_bytes(s, bool(s["has_paid"])) for s in subscriptions}
-    known = [v for v in limits.values() if v]
+    quotas = {s["id"]: get_quota(s, now) for s in subscriptions}
+    counted = [q for q in quotas.values() if q.limit]
     if not subscriptions:
         return CheckResult([], [], [], [])
 
-    # Кандидаты на превышение: трафик за последние 31 день не меньше минимального лимита.
-    # Текущий 30-дневный период целиком входит в это окно, остальные заведомо в лимите.
+    # Кандидаты на превышение: трафик с самого раннего начала квоты не меньше минимального лимита.
+    # Окно покрывает квоту любого пользователя, поэтому остальные заведомо в лимите.
     candidates = {}
-    if known:
-        window_start = (now - timedelta(days=PERIOD_DAYS + 1)).date().isoformat()
-        candidates = await panel_api.get_squad_usage(squad, window_start, now.date().isoformat(), min(known))
+    if counted:
+        window_start = min(q.start for q in counted)
+        candidates = await panel_api.get_squad_usage(
+            squad, _day(window_start), _day(now), min(q.limit for q in counted)
+        )
         if candidates is None:
             return None
 
@@ -267,13 +334,11 @@ async def _check_all(panel_api, now: Optional[datetime] = None) -> Optional[Chec
             await db.set_panel_user_id(sub["id"], user["id"])
 
         in_squad = squad in {s["uuid"] for s in user.get("activeInternalSquads", [])}
-        limit = limits[sub["id"]]
-        start, _ = current_period(sub.get("bs_period_anchor"), now)
-        key = period_key(start)
+        quota = quotas[sub["id"]]
         state = sub.get("bs_state")
 
-        # Новый период: исчерпанный лимит и ручное «без лимита» больше не действуют
-        if state in ("exhausted", "admin_on") and sub.get("bs_state_period") != key:
+        # Квота обновилась (новые 30 дней, оплата, конец оплаченных дней) — прежнее состояние не действует
+        if state in ("exhausted", "admin_on") and sub.get("bs_state_period") != quota.key:
             if state == "exhausted":
                 restored.append(sub)
             state = None
@@ -283,24 +348,24 @@ async def _check_all(panel_api, now: Optional[datetime] = None) -> Optional[Chec
             continue
 
         expire = _parse_utc(user.get("expireAt"))
-        if limit is None or not expire or expire <= now:
-            # БС не положены или подписка истекла — сквад не выдаём (ручное включение админа не трогаем)
-            if in_squad and state != "admin_on" and limit is None:
+        if quota.limit is None or not expire or expire <= now:
+            # БС не входят в тариф — снимаем; истёкшую подписку не трогаем (ручное включение админа тоже)
+            if in_squad and state != "admin_on" and quota.limit is None:
                 to_remove.append(user["id"])
+            if sub in restored:
+                restored.remove(sub)
             continue
 
         over = False
         if state != "admin_on" and user["id"] in candidates:
-            used = await panel_api.get_squad_user_usage_bytes(
-                squad, user["id"], start.date().isoformat(), now.date().isoformat()
-            )
-            over = used is not None and used >= limit
+            used = await panel_api.get_squad_user_usage_bytes(squad, user["id"], _day(quota.start), _day(now))
+            over = used is not None and used >= quota.limit
 
         if over:
             if in_squad:
                 to_remove.append(user["id"])
             if state != "exhausted":
-                await db.set_bs_state(sub["id"], "exhausted", key)
+                await db.set_bs_state(sub["id"], "exhausted", quota.key)
                 exhausted.append(sub)
             if sub in restored:
                 restored.remove(sub)
@@ -337,13 +402,13 @@ async def disable_for_all(panel_api) -> Optional[int]:
 async def notify_users(bot, result: CheckResult):
     """Сообщить пользователям, что лимит БС исчерпан / снова доступен"""
     for sub in result.exhausted:
-        _, reset_at = current_period(sub.get("bs_period_anchor"))
-        limit = limit_bytes(sub, bool(sub["has_paid"])) or 0
+        quota = get_quota(sub)
         await _send(bot, sub["telegram_id"], (
             f"🛡 <b>Лимит белых списков исчерпан</b>\n\n"
-            f"Подписка <b>{sub['tariff_name']}</b>: использовано {format_gb(limit)} ГБ на серверах белых списков.\n"
+            f"Подписка <b>{sub['tariff_name']}</b>: использовано {format_gb(quota.limit or 0)} ГБ "
+            f"на серверах белых списков.\n"
             f"Обычные серверы продолжают работать без ограничений.\n\n"
-            f"Доступ к белым спискам вернётся <b>{format_moment(reset_at)}</b> или сразу после продления подписки."
+            f"Доступ к белым спискам {_when_back(quota)}."
         ))
     for sub in result.restored:
         await _send(bot, sub["telegram_id"], (

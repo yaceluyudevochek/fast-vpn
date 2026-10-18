@@ -534,7 +534,7 @@ async def activate_trial(callback: CallbackQuery):
                     days=7,
                     hwid_limit=tariff_type['hwid_limit'],
                     tag=referrer_tag,
-                    extra_squad_ids=await whitelist.squads_for_new_user(tariff_type, referrer_id)
+                    extra_squad_ids=await whitelist.squads_for_new_user(tariff_type)
                 )
 
                 if new_referrer_user:
@@ -582,7 +582,7 @@ async def activate_trial(callback: CallbackQuery):
             days=3,
             hwid_limit=tariff_type['hwid_limit'],
             tag=tag,
-            extra_squad_ids=await whitelist.squads_for_new_user(tariff_type, user.id)
+            extra_squad_ids=await whitelist.squads_for_new_user(tariff_type)
         )
 
         if new_user:
@@ -640,7 +640,7 @@ async def activate_trial(callback: CallbackQuery):
                         days=7,
                         hwid_limit=tariff_type['hwid_limit'],
                         tag=referrer_tag,
-                        extra_squad_ids=await whitelist.squads_for_new_user(tariff_type, referrer_id)
+                        extra_squad_ids=await whitelist.squads_for_new_user(tariff_type)
                     )
 
                     if new_referrer_user:

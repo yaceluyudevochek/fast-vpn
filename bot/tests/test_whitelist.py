@@ -1,9 +1,9 @@
-"""Тесты белых списков: лимиты, периоды по 30 дней, выдача/снятие сквада, решения админа, миграция."""
+"""Тесты белых списков: квота на оплаченные/неоплаченные дни, выдача/снятие сквада, решения админа, миграция."""
 import asyncio
 import os
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import _bootstrap  # noqa: F401  (путь к проекту и конфиг)
 
@@ -28,10 +28,21 @@ def sql(path, query, params=()):
     return rows
 
 
+def utcnow() -> datetime:
+    """Текущий момент в UTC без зоны — так время хранится в БД"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def ts(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 class FakePanel:
+    """Панель с посуточной статистикой трафика на нодах сквада БС"""
+
     def __init__(self):
         self.users = {}       # username -> {id, username, expireAt, activeInternalSquads}
-        self.usage = {}       # panel id -> байты на нодах сквада БС
+        self.daily = {}       # panel id -> {date: байты}
         self.exact_calls = []
 
     def add(self, username, uid, squads=(STD,), expire=FUTURE):
@@ -39,6 +50,15 @@ class FakePanel:
             "id": uid, "username": username, "expireAt": expire,
             "activeInternalSquads": [{"uuid": s, "name": s} for s in squads],
         }
+
+    def use(self, uid, moment: datetime, gb: float):
+        days = self.daily.setdefault(uid, {})
+        day = moment.date()
+        days[day] = days.get(day, 0) + int(gb * GB)
+
+    def _sum(self, uid, start, end):
+        start, end = date.fromisoformat(start), date.fromisoformat(end)
+        return sum(b for d, b in self.daily.get(uid, {}).items() if start <= d <= end)
 
     def squads(self, username):
         return [s["uuid"] for s in self.users[username]["activeInternalSquads"]]
@@ -54,12 +74,13 @@ class FakePanel:
 
     async def get_squad_usage(self, squad, start, end, min_total_bytes=0):
         assert squad == BS
-        return {uid: b for uid, b in self.usage.items() if b >= min_total_bytes}
+        totals = {uid: self._sum(uid, start, end) for uid in self.daily}
+        return {uid: b for uid, b in totals.items() if b >= min_total_bytes}
 
     async def get_squad_user_usage_bytes(self, squad, uid, start, end):
         assert squad == BS
         self.exact_calls.append(uid)
-        return self.usage.get(uid, 0)
+        return self._sum(uid, start, end)
 
     async def add_users_to_squad(self, squad, ids):
         for uid in ids:
@@ -93,71 +114,89 @@ async def fresh_db():
     await db.init_db()
     sql(path, "UPDATE tariff_types SET bs_limit_gb = 50 WHERE id = 1")   # Default: 50 ГБ
     sql(path, "UPDATE tariff_types SET bs_limit_gb = NULL WHERE id = 2")  # Premium: БС не входят
+    whitelist.config.BS_SQUAD_UUID = BS
+    await whitelist.set_enabled(True)
     return path
 
 
-async def make_sub(path, tid, username, type_id=1, paid=False, anchor_days_ago=1, state=None, state_period=None):
+async def make_sub(path, tid, username, type_id=1, anchor=None, paid_until=None, state=None, state_period=None):
+    """Подписка; anchor — начало периода/пула, paid_until — до какого момента дни оплачены (None — не платил)"""
     sql(path, "INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (tid,))
     sid = await db.create_subscription(tid, type_id, 1 if type_id == 1 else 4, f"s-{username}", FUTURE, username)
-    anchor = (NOW - timedelta(days=anchor_days_ago)).strftime("%Y-%m-%d %H:%M:%S")
-    sql(path, "UPDATE subscriptions SET bs_period_anchor = ?, bs_state = ?, bs_state_period = ? WHERE id = ?",
-        (anchor, state, state_period, sid))
-    if paid:
-        sql(path, "INSERT INTO payment_transactions (transaction_id, telegram_id, plan_id, amount, status) "
-                  "VALUES (?, ?, 1, 150, 'CONFIRMED')", (f"pay-{username}", tid))
+    sql(path, "UPDATE subscriptions SET bs_period_anchor = ?, bs_paid_until = ?, bs_state = ?, bs_state_period = ? "
+              "WHERE id = ?",
+        (ts(anchor or NOW - timedelta(days=1)), ts(paid_until) if paid_until else None, state, state_period, sid))
     return sid
 
 
 def state(path, sid):
-    return sql(path, "SELECT bs_state, bs_state_period FROM subscriptions WHERE id = ?", (sid,))[0]
+    return sql(path, "SELECT bs_state FROM subscriptions WHERE id = ?", (sid,))[0][0]
+
+
+async def sub(sid):
+    return await db.get_subscription(sid)
 
 
 async def test_period_math():
-    anchor = (NOW - timedelta(days=65)).strftime("%Y-%m-%d %H:%M:%S")
-    start, reset = whitelist.current_period(anchor, NOW)
+    start, reset = whitelist.current_period(ts(NOW - timedelta(days=65)), NOW)
     assert start == NOW - timedelta(days=5) and reset == NOW + timedelta(days=25), (start, reset)
-    start, reset = whitelist.current_period((NOW - timedelta(hours=1)).isoformat(), NOW)
-    assert start == NOW - timedelta(hours=1)
     assert whitelist.current_period(None, NOW)[0] == NOW
     assert whitelist.format_gb(50 * GB) == "50" and whitelist.format_gb(int(32.6 * GB)) == "32.6"
-    print("OK  период БС: 30 дней от покупки, следующие периоды отсчитываются от той же даты")
+
+    paid = {"bs_limit_gb": 50, "bs_period_anchor": ts(NOW - timedelta(days=40)), "bs_paid_until": ts(NOW + timedelta(days=60))}
+    q = whitelist.get_quota(paid, NOW)
+    assert q.paid and q.limit == 50 * GB and q.start == NOW - timedelta(days=10) and q.refresh_is_full
+
+    unpaid = {"bs_limit_gb": 50, "bs_period_anchor": ts(NOW - timedelta(days=90)), "bs_paid_until": None}
+    q = whitelist.get_quota(unpaid, NOW)
+    assert not q.paid and q.limit == 3 * GB and q.start == NOW - timedelta(days=90) and not q.refresh_is_full
+
+    after_paid = dict(paid, bs_paid_until=ts(NOW - timedelta(days=5)))
+    q = whitelist.get_quota(after_paid, NOW)
+    assert not q.paid and q.limit == 3 * GB and q.start == NOW - timedelta(days=5)
+
+    assert whitelist.get_quota({"bs_limit_gb": None}, NOW).limit is None
+    print("OK  квота: оплаченные дни — полный лимит каждые 30 дней, неоплаченные — разовый пул 3 ГБ с конца оплаты/начала триала")
 
 
 async def test_disabled():
-    await fresh_db()
+    path = os.path.join(tempfile.mkdtemp(), "t.db")
+    db.DB_PATH = path
+    await db.init_db()
     whitelist.config.BS_SQUAD_UUID = BS
     panel = FakePanel()
     assert not await whitelist.is_enabled()
     assert await whitelist.check_all(panel, NOW) is None
-    assert await whitelist.squads_for_new_user({"bs_limit_gb": 50}, 1) == []
+    assert await whitelist.squads_for_new_user({"bs_limit_gb": 50}) == []
 
     whitelist.config.BS_SQUAD_UUID = ""   # сквад не задан — выключено даже при флаге
     await whitelist.set_enabled(True)
     assert not await whitelist.is_enabled()
     whitelist.config.BS_SQUAD_UUID = BS
-    print("OK  выключено: проверки нет, новым пользователям сквад не выдаётся, без BS_SQUAD_UUID не включается")
+    assert await whitelist.squads_for_new_user({"bs_limit_gb": 50}) == [BS]
+    assert await whitelist.squads_for_new_user({"bs_limit_gb": None}) == []
+    print("OK  выключено: проверки нет, сквад новым не выдаётся; включено — выдаётся, если БС входят в тариф")
 
 
 async def test_check_all():
     path = await fresh_db()
-    whitelist.config.BS_SQUAD_UUID = BS
-    await whitelist.set_enabled(True)
     panel = FakePanel()
+    paid = NOW + timedelta(days=90)
 
-    a = await make_sub(path, 1, "a", paid=True)                      # 10 ГБ из 50 -> выдать
-    panel.add("a", 101); panel.usage[101] = 10 * GB
-    b = await make_sub(path, 2, "b", paid=False)                     # триал: 4 ГБ из 3 -> исчерпан
-    panel.add("b", 102); panel.usage[102] = 4 * GB
-    c = await make_sub(path, 3, "c", paid=True)                      # в скваде, 60 ГБ из 50 -> снять
-    panel.add("c", 103, squads=(STD, BS)); panel.usage[103] = 60 * GB
-    d = await make_sub(path, 4, "d", type_id=2, paid=True)           # тариф без БС, но в скваде -> снять
+    a = await make_sub(path, 1, "a", paid_until=paid)                # 10 ГБ из 50 -> выдать
+    panel.add("a", 101); panel.use(101, NOW, 10)
+    b = await make_sub(path, 2, "b")                                 # не платил: 4 ГБ из 3 -> исчерпан
+    panel.add("b", 102); panel.use(102, NOW, 4)
+    c = await make_sub(path, 3, "c", paid_until=paid)                # в скваде, 60 ГБ из 50 -> снять
+    panel.add("c", 103, squads=(STD, BS)); panel.use(103, NOW, 60)
+    await make_sub(path, 4, "d", type_id=2, paid_until=paid)         # тариф без БС, но в скваде -> снять
     panel.add("d", 104, squads=(STD, BS))
-    e = await make_sub(path, 5, "e", paid=True, state="admin_off")   # отключён админом -> не трогать
+    e = await make_sub(path, 5, "e", paid_until=paid, state="admin_off")  # отключён админом -> не трогать
     panel.add("e", 105)
-    await make_sub(path, 6, "f", paid=True)                          # истекла -> не выдавать
+    await make_sub(path, 6, "f", paid_until=paid)                    # истекла -> не выдавать
     panel.add("f", 106, expire=PAST)
-    await make_sub(path, 7, "g", paid=True)                          # 2 ГБ < мин. лимита -> выдать без точного запроса
-    panel.add("g", 107, squads=(STD, ADMIN_SQUAD)); panel.usage[107] = 2 * GB
+    await make_sub(path, 7, "g", paid_until=paid)                    # 2 ГБ < мин. лимита -> выдать без точного запроса
+    panel.add("g", 107, squads=(STD, ADMIN_SQUAD)); panel.use(107, NOW, 2)
     panel.add("friend", 999, squads=(STD, ADMIN_SQUAD, BS))          # не пользователь бота -> не трогать
 
     result = await whitelist.check_all(panel, NOW)
@@ -165,110 +204,189 @@ async def test_check_all():
     assert result.removed == [103, 104], result.removed
     assert sorted(s["telegram_id"] for s in result.exhausted) == [2, 3]
     assert BS in panel.squads("a") and BS in panel.squads("g") and ADMIN_SQUAD in panel.squads("g")
-    assert BS not in panel.squads("b") and BS not in panel.squads("c") and BS not in panel.squads("d")
-    assert BS not in panel.squads("e") and BS not in panel.squads("f")
+    for name in ("b", "c", "d", "e", "f"):
+        assert BS not in panel.squads(name), name
     assert panel.squads("friend") == [STD, ADMIN_SQUAD, BS]
     assert 107 not in panel.exact_calls and 101 in panel.exact_calls
-    assert state(path, b)[0] == "exhausted" and state(path, c)[0] == "exhausted"
-    assert state(path, e)[0] == "admin_off" and state(path, a)[0] is None
+    assert state(path, b) == "exhausted" and state(path, c) == "exhausted"
+    assert state(path, e) == "admin_off" and state(path, a) is None
     assert sql(path, "SELECT panel_user_id FROM subscriptions WHERE id = ?", (a,))[0][0] == 101
 
     bot = FakeBot()
     await whitelist.notify_users(bot, result)
-    assert sorted(chat for chat, _ in bot.sent) == [2, 3] and "исчерпан" in bot.sent[0][1]
+    texts = dict(bot.sent)
+    assert sorted(texts) == [2, 3]
+    assert "после оплаты подписки" in texts[2]         # неоплаченные дни: вернётся только после оплаты
+    assert "или сразу после продления" in texts[3]    # оплаченные: обновится через 30 дней
 
-    # Повторная проверка ничего не меняет и не дублирует уведомления
     again = await whitelist.check_all(panel, NOW)
     assert again.added == [] and again.removed == [] and again.exhausted == [] and again.restored == []
 
-    # Через 30 дней: новый период, трафик в нём маленький -> сквад вернулся, уведомление «снова доступны»
-    panel.usage[103] = 1 * GB
-    panel.usage[102] = 0
+    # Через 30 дней: у оплаченного новый период — сквад вернулся; у неоплаченного пул не пополняется
     later = NOW + timedelta(days=30)
     result = await whitelist.check_all(panel, later)
-    assert 103 in result.added and 102 in result.added, result.added
-    assert sorted(s["telegram_id"] for s in result.restored) == [2, 3]
-    assert state(path, c)[0] is None and BS in panel.squads("c")
-    print("OK  проверка БС: выдача по тарифу, лимит триала 3 ГБ, снятие за лимит/тариф, admin_off, истёкшие, чужие сквады и не-боты не тронуты, возврат в новом периоде")
+    assert result.added == [103], result.added
+    assert [s["telegram_id"] for s in result.restored] == [3]
+    assert state(path, c) is None and BS in panel.squads("c")
+    assert state(path, b) == "exhausted" and BS not in panel.squads("b")
+    print("OK  проверка БС: выдача по тарифу, снятие за лимит/тариф, admin_off, истёкшие, чужие сквады и не-боты не тронуты, "
+          "оплаченным лимит обновляется, неоплаченным — нет")
+
+
+async def test_question_referral_days_then_payment():
+    """100 бонусных дней без оплаты, потом оплата на 30 дней: полный лимит только на оплаченные 30 дней"""
+    path = await fresh_db()
+    panel = FakePanel()
+    joined = NOW - timedelta(days=20)
+    sid = await make_sub(path, 1, "u", anchor=joined)
+    panel.add("u", 101)
+    panel.use(101, joined + timedelta(days=1), 2)               # 2 ГБ за бонусные дни (из пула 3 ГБ)
+
+    q = whitelist.get_quota(await sub(sid), NOW)
+    assert not q.paid and q.limit == 3 * GB
+
+    await db.add_bs_paid_days(sid, 30, NOW, restart_period=True)   # оплатил 30 дней
+    q = whitelist.get_quota(await sub(sid), NOW + timedelta(days=1))
+    assert q.paid and q.limit == 50 * GB and q.start == NOW and q.refresh_at == NOW + timedelta(days=30)
+    panel.use(101, NOW + timedelta(days=1), 45)                  # 45 ГБ в оплаченные дни
+    await whitelist.check_all(panel, NOW + timedelta(days=2))
+    assert BS in panel.squads("u") and state(path, sid) is None
+
+    # Оплаченные дни кончились, дальше — снова бонусные: 3 ГБ разово, с конца оплаты
+    after = NOW + timedelta(days=31)
+    q = whitelist.get_quota(await sub(sid), after)
+    assert not q.paid and q.limit == 3 * GB and q.start == NOW + timedelta(days=30)
+    panel.use(101, after, 2)
+    await whitelist.check_all(panel, after)
+    assert BS in panel.squads("u")                               # 2 из 3 ГБ — ещё можно
+    panel.use(101, after + timedelta(days=10), 1.5)
+    await whitelist.check_all(panel, after + timedelta(days=10))
+    assert state(path, sid) == "exhausted" and BS not in panel.squads("u")
+    # ...и не возвращается сам ни через 30, ни через 60 дней
+    await whitelist.check_all(panel, after + timedelta(days=70))
+    assert state(path, sid) == "exhausted" and BS not in panel.squads("u")
+    status = await whitelist.get_status(panel, await sub(sid))
+    print("OK  вопрос 1: бонусные дни → 3 ГБ, оплата 30 дней → 50 ГБ на 30 дней, потом снова разовые 3 ГБ без пополнения")
+    return status
+
+
+async def test_question_referral_farmer():
+    """Не платит и приглашает людей: 3 ГБ на всё время, даже если трафик растянут на месяцы"""
+    path = await fresh_db()
+    panel = FakePanel()
+    sid = await make_sub(path, 1, "farmer", anchor=NOW - timedelta(days=120))
+    panel.add("farmer", 101)
+    panel.use(101, NOW - timedelta(days=100), 1)
+    panel.use(101, NOW - timedelta(days=60), 1)
+    panel.use(101, NOW - timedelta(days=20), 1.5)               # за последние 31 день всего 1.5 ГБ
+
+    result = await whitelist.check_all(panel, NOW)
+    assert [s["telegram_id"] for s in result.exhausted] == [1]
+    assert BS not in panel.squads("farmer")
+    print("OK  вопрос 2: неплатящий «фармер» рефералов — 3 ГБ разово на всё время, растянутый трафик тоже учитывается")
 
 
 async def test_payment_and_admin():
     path = await fresh_db()
-    whitelist.config.BS_SQUAD_UUID = BS
-    await whitelist.set_enabled(True)
     panel = FakePanel()
 
-    c = await make_sub(path, 3, "c", paid=True, anchor_days_ago=10)
-    panel.add("c", 103); panel.usage[103] = 60 * GB
-    await whitelist.check_all(panel, NOW)
-    assert state(path, c)[0] == "exhausted"
+    c = await make_sub(path, 3, "c", paid_until=NOW + timedelta(days=20), anchor=NOW - timedelta(days=10))
+    panel.add("c", 103); panel.use(103, datetime.now(timezone.utc), 60)
+    await whitelist.check_all(panel)
+    assert state(path, c) == "exhausted"
 
-    # Продление: новый период, сквад сразу возвращается
-    await whitelist.on_payment(panel, 3, 1)
-    assert state(path, c) == (None, None) and BS in panel.squads("c")
-    anchor = sql(path, "SELECT bs_period_anchor FROM subscriptions WHERE id = ?", (c,))[0][0]
-    assert anchor and datetime.fromisoformat(anchor).replace(tzinfo=timezone.utc) > NOW - timedelta(days=1)
+    # Продление безлимитного плана: оплаченные дни складываются, период начинается заново, сквад сразу возвращается
+    before = (await sub(c))["bs_paid_until"]
+    await whitelist.on_payment(panel, 3, {"tariff_type_id": 1, "days": 30, "traffic_limit_bytes": 0})
+    s = await sub(c)
+    assert state(path, c) is None and BS in panel.squads("c")
+    assert datetime.fromisoformat(s["bs_paid_until"]) == datetime.fromisoformat(before) + timedelta(days=30)
+    assert datetime.fromisoformat(s["bs_period_anchor"]) > utcnow() - timedelta(minutes=5)
 
-    # Админ отключил БС — проверка не возвращает, оплата тоже не отменяет решение админа
-    sub = await db.get_subscription(c)
-    assert await whitelist.admin_set_user_squad(panel, sub, BS, False)
-    assert state(path, c)[0] == "admin_off" and BS not in panel.squads("c")
-    panel.usage[103] = 0
-    await whitelist.check_all(panel, NOW)
-    assert BS not in panel.squads("c")
-    await whitelist.on_payment(panel, 3, 1)
-    assert state(path, c)[0] == "admin_off" and BS not in panel.squads("c")
+    # Лимитный план: срок от текущего момента (остаток сгорает, как и в панели)
+    await whitelist.on_payment(panel, 3, {"tariff_type_id": 1, "days": 30, "traffic_limit_bytes": 100 * GB})
+    paid_until = datetime.fromisoformat((await sub(c))["bs_paid_until"])
+    assert abs(paid_until - (utcnow() + timedelta(days=30))) < timedelta(minutes=5)
 
-    # Админ включил вручную — без лимита до конца периода
-    sub = await db.get_subscription(c)
-    assert await whitelist.admin_set_user_squad(panel, sub, BS, True)
-    assert state(path, c)[0] == "admin_on"
-    panel.usage[103] = 500 * GB
-    result = await whitelist.check_all(panel, datetime.now(timezone.utc))
+    # Админ отключил БС — проверка и оплата не возвращают
+    assert await whitelist.admin_set_user_squad(panel, await sub(c), BS, False)
+    assert state(path, c) == "admin_off" and BS not in panel.squads("c")
+    await whitelist.check_all(panel)
+    await whitelist.on_payment(panel, 3, {"tariff_type_id": 1, "days": 30, "traffic_limit_bytes": 0})
+    assert state(path, c) == "admin_off" and BS not in panel.squads("c")
+
+    # Админ включил вручную — без лимита до обновления квоты
+    assert await whitelist.admin_set_user_squad(panel, await sub(c), BS, True)
+    assert state(path, c) == "admin_on"
+    panel.use(103, datetime.now(timezone.utc), 500)
+    result = await whitelist.check_all(panel)
     assert BS in panel.squads("c") and result.removed == []
 
     # Другие сквады админ переключает без изменения состояния БС
-    assert await whitelist.admin_set_user_squad(panel, sub, ADMIN_SQUAD, True)
-    assert ADMIN_SQUAD in panel.squads("c") and state(path, c)[0] == "admin_on"
+    assert await whitelist.admin_set_user_squad(panel, await sub(c), ADMIN_SQUAD, True)
+    assert ADMIN_SQUAD in panel.squads("c") and state(path, c) == "admin_on"
 
-    # Новый пользователь: сквад БС по тарифу (триал — по лимиту 3 ГБ), тариф без БС — без сквада
-    assert await whitelist.squads_for_new_user({"bs_limit_gb": 50}, 3) == [BS]
-    assert await whitelist.squads_for_new_user({"bs_limit_gb": None}, 3) == []
-    assert await whitelist.squads_for_new_user({"bs_limit_gb": None}, 777) == [BS]   # не платил: 3 ГБ
+    # Дни от админа неплатившему — полный лимит, период от момента выдачи
+    t = await make_sub(path, 4, "trial", anchor=NOW - timedelta(days=50))
+    panel.add("trial", 104)
+    await whitelist.on_admin_days(panel, t, 30)
+    q = whitelist.get_quota(await sub(t))
+    assert q.paid and q.limit == 50 * GB and q.start > datetime.now(timezone.utc) - timedelta(minutes=5)
+    # Дни от админа оплатившему — складываются, период не сбрасывается
+    anchor_before = (await sub(t))["bs_period_anchor"]
+    await whitelist.on_admin_days(panel, t, 10)
+    s = await sub(t)
+    assert s["bs_period_anchor"] == anchor_before
+    assert abs(datetime.fromisoformat(s["bs_paid_until"]) - (utcnow() + timedelta(days=40))) < timedelta(minutes=5)
+    # Админ уменьшил дни — уменьшается и оплаченный срок
+    await db.reduce_bs_paid_days(t, 15)
+    s = await sub(t)
+    assert abs(datetime.fromisoformat(s["bs_paid_until"]) - (utcnow() + timedelta(days=25))) < timedelta(minutes=5)
 
     # Отключить у всех: снимается у всех, у кого есть (и у не-ботов), другие сквады остаются
     panel.add("friend", 999, squads=(ADMIN_SQUAD, BS))
     removed = await whitelist.disable_for_all(panel)
-    assert removed == 2 and BS not in panel.squads("c") and panel.squads("friend") == [ADMIN_SQUAD]
+    assert removed == 3 and BS not in panel.squads("c") and panel.squads("friend") == [ADMIN_SQUAD]
     assert not await whitelist.is_enabled()
-    print("OK  БС: оплата начинает новый период, admin_off/admin_on, переключение других сквадов, выдача новым, «отключить у всех»")
+    print("OK  оплата и админ: дни складываются, лимитный план — от текущего момента, admin_off/admin_on, "
+          "дни от админа = полный лимит, уменьшение дней, «отключить у всех»")
 
 
 async def test_status_text():
     path = await fresh_db()
-    whitelist.config.BS_SQUAD_UUID = BS
-    await whitelist.set_enabled(True)
     panel = FakePanel()
-    sid = await make_sub(path, 1, "a", paid=True)
-    panel.add("a", 101); panel.usage[101] = int(17.4 * GB)
+    now = datetime.now(timezone.utc)
+    sid = await make_sub(path, 1, "a", anchor=now - timedelta(days=1), paid_until=now + timedelta(days=60))
+    panel.add("a", 101); panel.use(101, now, 17.4)
 
-    status = await whitelist.get_status(panel, await db.get_subscription(sid))
-    assert status.limit == 50 * GB and status.remaining == int(50 * GB) - int(17.4 * GB)
-    assert "осталось <b>32.6 из 50 ГБ</b>" in whitelist.status_text(status), whitelist.status_text(status)
+    text = whitelist.status_text(await whitelist.get_status(panel, await sub(sid)))
+    assert "осталось <b>32.6 из 50 ГБ</b>" in text and "Лимит обновится" in text, text
 
-    panel.usage[101] = 51 * GB
-    status = await whitelist.get_status(panel, await db.get_subscription(sid))
-    assert "исчерпан" in whitelist.status_text(status)
+    # Оплаченные дни кончаются раньше конца 30-дневного периода
+    sql(path, "UPDATE subscriptions SET bs_paid_until = ? WHERE id = ?", (ts(now + timedelta(days=5)), sid))
+    text = whitelist.status_text(await whitelist.get_status(panel, await sub(sid)))
+    assert "по оплаченным дням" in text and "3 ГБ до продления" in text, text
+
+    # Неоплаченные дни
+    sql(path, "UPDATE subscriptions SET bs_paid_until = NULL, bs_period_anchor = ? WHERE id = ?",
+        (ts(now - timedelta(days=1)), sid))
+    panel.daily[101] = {}
+    panel.use(101, now, 1)
+    text = whitelist.status_text(await whitelist.get_status(panel, await sub(sid)))
+    assert "осталось <b>2 из 3 ГБ</b>" in text and "Без оплаты лимит не пополняется" in text, text
+    panel.use(101, now, 5)
+    text = whitelist.status_text(await whitelist.get_status(panel, await sub(sid)))
+    assert "исчерпан" in text and "после оплаты подписки" in text, text
 
     sql(path, "UPDATE tariff_types SET bs_limit_gb = NULL WHERE id = 1")
-    assert await whitelist.get_status(panel, await db.get_subscription(sid)) is None
-    await whitelist.set_enabled(False)
+    assert await whitelist.get_status(panel, await sub(sid)) is None
     sql(path, "UPDATE tariff_types SET bs_limit_gb = 50 WHERE id = 1")
-    assert await whitelist.get_status(panel, await db.get_subscription(sid)) is None
-    print("OK  карточка подписки: «осталось X из Y ГБ», исчерпан, не показывается без БС в тарифе или при выключенных БС")
+    await whitelist.set_enabled(False)
+    assert await whitelist.get_status(panel, await sub(sid)) is None
+    print("OK  карточка подписки: остаток, когда обновится, «по оплаченным дням», неоплаченный пул, исчерпан, скрыто без БС")
 
 
-async def test_migration_anchor():
+async def test_migration():
     path = os.path.join(tempfile.mkdtemp(), "old.db")
     db.DB_PATH = path
     await db.init_db()
@@ -276,13 +394,14 @@ async def test_migration_anchor():
     paid = await db.create_subscription(1, 1, 1, "s1", FUTURE, "u1")
     unpaid = await db.create_subscription(2, 1, 1, "s2", FUTURE, "u2")
     sql(path, "UPDATE subscriptions SET created_at = '2026-09-01 00:00:00'")
+    # план 1 — 30 дней безлимит: оплаты 10.09 и 05.10 (раньше конца первой) складываются
     sql(path, "INSERT INTO payment_transactions (transaction_id, telegram_id, plan_id, amount, status, activated_at) "
               "VALUES ('p1', 1, 1, 150, 'CONFIRMED', '2026-10-05 10:00:00'), "
-              "('p0', 1, 1, 150, 'CONFIRMED', '2026-09-05 10:00:00'), "
+              "('p0', 1, 1, 150, 'CONFIRMED', '2026-09-10 10:00:00'), "
               "('px', 1, 1, 150, 'CANCELED', '2026-10-10 10:00:00')")
     # «Боевая» БД v2.3.0: колонок БС ещё нет, user_version = 5
     conn = sqlite3.connect(path)
-    for column in ("bs_period_anchor", "bs_state", "bs_state_period", "panel_user_id"):
+    for column in ("bs_period_anchor", "bs_state", "bs_state_period", "panel_user_id", "bs_paid_until"):
         conn.execute(f"ALTER TABLE subscriptions DROP COLUMN {column}")
     conn.execute("ALTER TABLE tariff_types DROP COLUMN bs_limit_gb")
     conn.execute("PRAGMA user_version = 5")
@@ -290,19 +409,22 @@ async def test_migration_anchor():
     conn.close()
 
     await db.init_db()
-    anchors = dict(sql(path, "SELECT id, bs_period_anchor FROM subscriptions"))
-    assert anchors[paid] == "2026-10-05 10:00:00" and anchors[unpaid] == "2026-09-01 00:00:00", anchors
+    rows = {r[0]: r[1:] for r in sql(path, "SELECT id, bs_period_anchor, bs_paid_until FROM subscriptions")}
+    assert rows[paid] == ("2026-10-05 10:00:00", "2026-11-09 10:00:00"), rows[paid]
+    assert rows[unpaid] == ("2026-09-01 00:00:00", None), rows[unpaid]
     assert sql(path, "PRAGMA user_version")[0][0] == len(db._MIGRATIONS)
-    print("OK  миграция БС: период от последней оплаты подписки этого типа, без оплат — от создания")
+    print("OK  миграция БС: период от последней оплаты, оплаченный срок по истории оплат (продления складываются)")
 
 
 async def main():
     await test_period_math()
     await test_disabled()
     await test_check_all()
+    await test_question_referral_days_then_payment()
+    await test_question_referral_farmer()
     await test_payment_and_admin()
     await test_status_text()
-    await test_migration_anchor()
+    await test_migration()
 
 
 if __name__ == "__main__":

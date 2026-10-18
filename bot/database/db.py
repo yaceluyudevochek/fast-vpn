@@ -1,7 +1,7 @@
 import aiosqlite
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -220,6 +220,7 @@ async def _m006_whitelist(db):
     added = await _add_column(db, "subscriptions", "bs_period_anchor", "TIMESTAMP")  # от него идут периоды по 30 дней
     await _add_column(db, "subscriptions", "bs_state", "TEXT")            # NULL / exhausted / admin_off / admin_on
     await _add_column(db, "subscriptions", "bs_state_period", "TEXT")     # начало периода, к которому относится bs_state
+    paid_added = await _add_column(db, "subscriptions", "bs_paid_until", "TIMESTAMP")  # до какого момента дни оплачены
     await db.execute("""
         CREATE TABLE IF NOT EXISTS bot_settings (
             key TEXT PRIMARY KEY,
@@ -238,6 +239,35 @@ async def _m006_whitelist(db):
                    AND p.status = 'CONFIRMED'),
                 created_at, CURRENT_TIMESTAMP)
         """)
+    if paid_added:
+        await _fill_bs_paid_until(db)
+
+
+async def _fill_bs_paid_until(db):
+    """
+    Оплаченный срок по истории платежей: каждая оплата продлевает его на срок плана
+    (безлимитные планы — от max(текущий срок, момент оплаты), лимитные — от момента оплаты,
+    как продлевается и сама подписка). Бонусные/триальные дни сюда не входят.
+    """
+    async with db.execute("""
+        SELECT s.id, COALESCE(p.activated_at, p.confirmed_at, p.created_at) AS paid_at,
+               tp.days, tp.traffic_limit_bytes
+        FROM subscriptions s
+        JOIN payment_transactions p ON p.telegram_id = s.telegram_id AND p.status = 'CONFIRMED'
+        JOIN tariff_plans tp ON tp.id = p.plan_id AND tp.tariff_type_id = s.tariff_type_id
+        ORDER BY s.id, paid_at
+    """) as cursor:
+        rows = await cursor.fetchall()
+
+    paid_until = {}
+    for sub_id, paid_at, days, traffic_limit in rows:
+        moment = datetime.fromisoformat(paid_at)
+        current = paid_until.get(sub_id)
+        start = max(current, moment) if (current and not traffic_limit) else moment
+        paid_until[sub_id] = start + timedelta(days=days)
+    for sub_id, value in paid_until.items():
+        await db.execute("UPDATE subscriptions SET bs_paid_until = ? WHERE id = ?",
+                         (value.strftime("%Y-%m-%d %H:%M:%S"), sub_id))
 
 
 _MIGRATIONS = [
@@ -858,23 +888,12 @@ async def set_setting(key: str, value: str):
 # БЕЛЫЕ СПИСКИ (БС)
 # ======================================================
 
-async def user_has_paid(telegram_id: int) -> bool:
-    """Была ли у пользователя хотя бы одна подтверждённая оплата"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-                "SELECT 1 FROM payment_transactions WHERE telegram_id = ? AND status = 'CONFIRMED' LIMIT 1",
-                (telegram_id,)) as cursor:
-            return await cursor.fetchone() is not None
-
-
 async def get_bs_subscriptions() -> List[Dict[str, Any]]:
-    """Все подписки (кроме отключённых) с лимитом БС тарифа и признаком оплаты владельца"""
+    """Все подписки (кроме отключённых) с лимитом БС их тарифа"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
-            SELECT s.*, tt.name AS tariff_name, tt.bs_limit_gb,
-                   EXISTS (SELECT 1 FROM payment_transactions p
-                           WHERE p.telegram_id = s.telegram_id AND p.status = 'CONFIRMED') AS has_paid
+            SELECT s.*, tt.name AS tariff_name, tt.bs_limit_gb
             FROM subscriptions s
             JOIN tariff_types tt ON tt.id = s.tariff_type_id
             WHERE s.status != 'DISABLED' AND s.username_in_panel IS NOT NULL
@@ -892,16 +911,48 @@ async def set_bs_state(subscription_id: int, state: Optional[str], period: Optio
         await db.commit()
 
 
-async def restart_bs_period(subscription_id: int):
-    """Оплата: период БС начинается заново, исчерпанный лимит сбрасывается (решение админа «отключить» остаётся)"""
+def _sql_ts(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def add_bs_paid_days(subscription_id: int, days: int, now: datetime, from_now: bool = False,
+                           restart_period: bool = False):
+    """
+    Оплаченные дни (оплата или дни от админа): продлевают bs_paid_until.
+    Период БС начинается заново при оплате (restart_period) или если до этого оплаченных дней не было.
+    from_now — срок считается от текущего момента (лимитные тарифы: остаток сгорает, как и в панели).
+    Исчерпанный лимит и ручное «без лимита» сбрасываются; «отключено админом» остаётся.
+    """
+    subscription = await get_subscription(subscription_id)
+    if not subscription:
+        return
+    if now.tzinfo:  # в БД время хранится в UTC без зоны, как CURRENT_TIMESTAMP
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    paid_until = subscription.get("bs_paid_until")
+    paid_until = datetime.fromisoformat(paid_until) if paid_until else None
+    was_paid = paid_until is not None and paid_until > now
+    base = now if (from_now or not was_paid) else paid_until
+    old_anchor = subscription.get("bs_period_anchor")
+    anchor = now if (restart_period or not was_paid or not old_anchor) else datetime.fromisoformat(old_anchor)
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             UPDATE subscriptions
-            SET bs_period_anchor = CURRENT_TIMESTAMP,
+            SET bs_paid_until = ?, bs_period_anchor = ?,
                 bs_state = CASE WHEN bs_state = 'admin_off' THEN bs_state END,
                 bs_state_period = CASE WHEN bs_state = 'admin_off' THEN bs_state_period END
             WHERE id = ?
-        """, (subscription_id,))
+        """, (_sql_ts(base + timedelta(days=days)), _sql_ts(anchor), subscription_id))
+        await db.commit()
+
+
+async def reduce_bs_paid_days(subscription_id: int, days: int):
+    """Админ уменьшил дни подписки — уменьшаем и оплаченный срок"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE subscriptions SET bs_paid_until = datetime(bs_paid_until, ?)
+            WHERE id = ? AND bs_paid_until IS NOT NULL
+        """, (f"-{int(days)} days", subscription_id))
         await db.commit()
 
 
