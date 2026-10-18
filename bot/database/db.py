@@ -213,12 +213,40 @@ async def _m005_link_revokes(db):
     """)
 
 
+async def _m006_whitelist(db):
+    """Белые списки (БС): лимит у типа тарифа, период и состояние у подписки, настройки бота"""
+    await _add_column(db, "tariff_types", "bs_limit_gb", "INTEGER")       # NULL = БС не входит в тариф
+    await _add_column(db, "subscriptions", "panel_user_id", "INTEGER")    # числовой id пользователя в панели
+    added = await _add_column(db, "subscriptions", "bs_period_anchor", "TIMESTAMP")  # от него идут периоды по 30 дней
+    await _add_column(db, "subscriptions", "bs_state", "TEXT")            # NULL / exhausted / admin_off / admin_on
+    await _add_column(db, "subscriptions", "bs_state_period", "TEXT")     # начало периода, к которому относится bs_state
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    if added:
+        # Период БС считается от последней оплаты подписки этого типа, без оплат — от создания подписки
+        await db.execute("""
+            UPDATE subscriptions SET bs_period_anchor = COALESCE(
+                (SELECT MAX(COALESCE(p.activated_at, p.confirmed_at, p.created_at))
+                 FROM payment_transactions p
+                 JOIN tariff_plans tp ON tp.id = p.plan_id
+                 WHERE p.telegram_id = subscriptions.telegram_id
+                   AND tp.tariff_type_id = subscriptions.tariff_type_id
+                   AND p.status = 'CONFIRMED'),
+                created_at, CURRENT_TIMESTAMP)
+        """)
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
     (3, _m003_trial_nudge),
     (4, _m004_promo_codes),
     (5, _m005_link_revokes),
+    (6, _m006_whitelist),
 ]
 
 
@@ -437,6 +465,7 @@ async def get_subscription(subscription_id: int) -> Optional[Dict[str, Any]]:
                    tt.name as tariff_name,
                    tt.hwid_limit as tariff_hwid_limit,
                    tt.squad_id,
+                   tt.bs_limit_gb,
                    tp.days as tariff_days,
                    tp.price as tariff_price
             FROM subscriptions s
@@ -489,8 +518,9 @@ async def create_subscription(
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
             INSERT INTO subscriptions 
-            (telegram_id, tariff_type_id, tariff_plan_id, short_uuid, subscription_expiry, username_in_panel, trial_used)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (telegram_id, tariff_type_id, tariff_plan_id, short_uuid, subscription_expiry, username_in_panel, trial_used,
+             bs_period_anchor)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (telegram_id, tariff_type_id, tariff_plan_id, short_uuid, expiry, username_in_panel, 1 if trial else 0))
 
         await db.commit()
@@ -801,6 +831,92 @@ async def record_link_revoke(subscription_id: int):
                 last_revoke = excluded.last_revoke,
                 revoke_count = revoke_count + 1
         """, (subscription_id, datetime.now().isoformat()))
+        await db.commit()
+
+
+# ======================================================
+# НАСТРОЙКИ БОТА (ключ-значение)
+# ======================================================
+
+async def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else default
+
+
+async def set_setting(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO bot_settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, (key, value))
+        await db.commit()
+
+
+# ======================================================
+# БЕЛЫЕ СПИСКИ (БС)
+# ======================================================
+
+async def user_has_paid(telegram_id: int) -> bool:
+    """Была ли у пользователя хотя бы одна подтверждённая оплата"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+                "SELECT 1 FROM payment_transactions WHERE telegram_id = ? AND status = 'CONFIRMED' LIMIT 1",
+                (telegram_id,)) as cursor:
+            return await cursor.fetchone() is not None
+
+
+async def get_bs_subscriptions() -> List[Dict[str, Any]]:
+    """Все подписки (кроме отключённых) с лимитом БС тарифа и признаком оплаты владельца"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT s.*, tt.name AS tariff_name, tt.bs_limit_gb,
+                   EXISTS (SELECT 1 FROM payment_transactions p
+                           WHERE p.telegram_id = s.telegram_id AND p.status = 'CONFIRMED') AS has_paid
+            FROM subscriptions s
+            JOIN tariff_types tt ON tt.id = s.tariff_type_id
+            WHERE s.status != 'DISABLED' AND s.username_in_panel IS NOT NULL
+        """) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+
+async def set_bs_state(subscription_id: int, state: Optional[str], period: Optional[str] = None):
+    """state: None (по умолчанию), 'exhausted' (лимит исчерпан), 'admin_off' / 'admin_on' (решение админа)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE subscriptions SET bs_state = ?, bs_state_period = ? WHERE id = ?",
+            (state, period, subscription_id)
+        )
+        await db.commit()
+
+
+async def restart_bs_period(subscription_id: int):
+    """Оплата: период БС начинается заново, исчерпанный лимит сбрасывается (решение админа «отключить» остаётся)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE subscriptions
+            SET bs_period_anchor = CURRENT_TIMESTAMP,
+                bs_state = CASE WHEN bs_state = 'admin_off' THEN bs_state END,
+                bs_state_period = CASE WHEN bs_state = 'admin_off' THEN bs_state_period END
+            WHERE id = ?
+        """, (subscription_id,))
+        await db.commit()
+
+
+async def count_bs_states() -> Dict[str, int]:
+    """Сколько подписок в каждом состоянии БС (exhausted / admin_off / admin_on)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+                "SELECT bs_state, COUNT(*) FROM subscriptions WHERE bs_state IS NOT NULL GROUP BY bs_state"
+        ) as cursor:
+            return {row[0]: row[1] for row in await cursor.fetchall()}
+
+
+async def set_panel_user_id(subscription_id: int, panel_user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE subscriptions SET panel_user_id = ? WHERE id = ?", (panel_user_id, subscription_id))
         await db.commit()
 
 

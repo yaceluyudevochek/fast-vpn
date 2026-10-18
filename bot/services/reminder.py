@@ -26,6 +26,7 @@ class SubscriptionReminder:
         self._task: Optional[asyncio.Task] = None
         # Храним информацию об отправленных уведомлениях
         self._sent_notifications: Dict[str, Dict] = {}
+        self._last_whitelist_check = float("-inf")
 
     async def start(self):
         if self.is_running:
@@ -55,7 +56,26 @@ class SubscriptionReminder:
                 await self._check_trial_nudges()
             except Exception as e:
                 logger.error(f"Error in trial nudge check: {e}", exc_info=True)
+            try:
+                await self._check_whitelist()
+            except Exception as e:
+                logger.error(f"Error in whitelist check: {e}", exc_info=True)
             await asyncio.sleep(self.check_interval)
+
+    async def _check_whitelist(self):
+        """Лимиты белых списков: раз в BS_CHECK_INTERVAL снимаем/возвращаем сквад БС"""
+        from config import config
+        from services import whitelist
+
+        interval = getattr(config, "BS_CHECK_INTERVAL", 600)
+        now = asyncio.get_running_loop().time()
+        if self.panel_api is None or now - self._last_whitelist_check < interval:
+            return
+        self._last_whitelist_check = now
+
+        result = await whitelist.check_all(self.panel_api)
+        if result:
+            await whitelist.notify_users(self.bot, result)
 
     async def _check_trial_nudges(self):
         """

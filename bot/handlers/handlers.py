@@ -12,6 +12,7 @@ from database import db as database
 from database import promo_db
 from services.promo import normalize_code
 from services.subscription_link import reissue_subscription_link
+from services import whitelist
 from handlers.payment import router as payment_router
 from handlers.ui_screens import show_screen
 from handlers.ui_emoji import E, BTN, kb_button
@@ -532,7 +533,8 @@ async def activate_trial(callback: CallbackQuery):
                     squad_id=tariff_type['squad_id'],
                     days=7,
                     hwid_limit=tariff_type['hwid_limit'],
-                    tag=referrer_tag
+                    tag=referrer_tag,
+                    extra_squad_ids=await whitelist.squads_for_new_user(tariff_type, referrer_id)
                 )
 
                 if new_referrer_user:
@@ -579,7 +581,8 @@ async def activate_trial(callback: CallbackQuery):
             squad_id=tariff_type['squad_id'],
             days=3,
             hwid_limit=tariff_type['hwid_limit'],
-            tag=tag
+            tag=tag,
+            extra_squad_ids=await whitelist.squads_for_new_user(tariff_type, user.id)
         )
 
         if new_user:
@@ -636,7 +639,8 @@ async def activate_trial(callback: CallbackQuery):
                         squad_id=tariff_type['squad_id'],
                         days=7,
                         hwid_limit=tariff_type['hwid_limit'],
-                        tag=referrer_tag
+                        tag=referrer_tag,
+                        extra_squad_ids=await whitelist.squads_for_new_user(tariff_type, referrer_id)
                     )
 
                     if new_referrer_user:
@@ -769,6 +773,15 @@ async def view_subscription(callback: CallbackQuery):
         f"{E['shield']} Устройств: <b>{devices_count} / {subscription['tariff_hwid_limit']}</b>\n",
         f"{E['chart']} Лимит трафика: <b>{traffic_text}</b>\n"
     ]
+
+    # Белые списки: остаток лимита (если БС включены и положены подписке)
+    try:
+        bs_status = await whitelist.get_status(panel_api, subscription)
+    except Exception as e:
+        logger.error(f"Whitelist status failed for subscription {subscription_id}: {e}")
+        bs_status = None
+    if bs_status:
+        text_parts.append(whitelist.status_text(bs_status, E['shield']))
 
     text = "".join(text_parts)
 

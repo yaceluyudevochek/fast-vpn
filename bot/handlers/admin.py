@@ -97,6 +97,8 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="➕ Добавить дни подписки", callback_data="admin_add_days")],
         [InlineKeyboardButton(text="➖ Уменьшить дни подписки", callback_data="admin_reduce_days")],
         [InlineKeyboardButton(text="🔗 Перевыпустить ссылку", callback_data="admin_revoke_link")],
+        [InlineKeyboardButton(text="🛡 Белые списки", callback_data="admin_bs")],
+        [InlineKeyboardButton(text="🧩 Сквады пользователя", callback_data="admin_user_squads")],
         [InlineKeyboardButton(text="💾 Управление бэкапами", callback_data="admin_backup")],
         [InlineKeyboardButton(text="👑 Добавить администратора", callback_data="admin_add_admin")],
         [InlineKeyboardButton(text="🎟 Промокоды", callback_data="admin_promos")],
@@ -237,6 +239,7 @@ async def admin_edit_type(callback: CallbackQuery):
         f"Лимит устройств: {tariff_type['hwid_limit']}\n"
         f"Описание: {tariff_type['description'] or 'нет'}\n"
         f"Полное описание: {'есть' if tariff_type.get('full_description') else 'нет'}\n"
+        f"Белые списки: {str(tariff_type['bs_limit_gb']) + ' ГБ / 30 дней' if tariff_type.get('bs_limit_gb') else 'не входят'}\n"
         f"Статус: {'✅ Активен' if tariff_type['is_active'] else '❌ Неактивен'}\n\n"
         f"Что хотите изменить?"
     )
@@ -247,6 +250,7 @@ async def admin_edit_type(callback: CallbackQuery):
         [InlineKeyboardButton(text="📱 Лимит устройств", callback_data=f"edit_type_field_{type_id}_hwid_limit")],
         [InlineKeyboardButton(text="📄 Описание", callback_data=f"edit_type_field_{type_id}_description")],
         [InlineKeyboardButton(text="📋 Полное описание", callback_data=f"edit_type_field_{type_id}_full_description")],
+        [InlineKeyboardButton(text="🛡 Лимит белых списков", callback_data=f"edit_type_field_{type_id}_bs_limit_gb")],
         [InlineKeyboardButton(
             text="🔄 Переключить статус",
             callback_data=f"toggle_type_{type_id}"
@@ -295,7 +299,8 @@ async def edit_type_field(callback: CallbackQuery, state: FSMContext):
         "squad_id": "Squad ID",
         "hwid_limit": "лимит устройств",
         "description": "короткое описание (для кнопки, до ~40 символов)",
-        "full_description": "полное описание (можно с форматированием, «-» — очистить)"
+        "full_description": "полное описание (можно с форматированием, «-» — очистить)",
+        "bs_limit_gb": "лимит трафика на серверах белых списков, ГБ за 30 дней («-» — белые списки не входят в тариф)"
     }
 
     if field not in field_names:
@@ -361,6 +366,7 @@ async def toggle_type_status(callback: CallbackQuery):
             f"Лимит устройств: {updated_type['hwid_limit']}\n"
             f"Описание: {updated_type['description'] or 'нет'}\n"
             f"Полное описание: {'есть' if updated_type.get('full_description') else 'нет'}\n"
+            f"Белые списки: {str(updated_type['bs_limit_gb']) + ' ГБ / 30 дней' if updated_type.get('bs_limit_gb') else 'не входят'}\n"
             f"Статус: {'✅ Активен' if updated_type['is_active'] else '❌ Неактивен'}\n\n"
             f"Что хотите изменить?"
         )
@@ -371,6 +377,7 @@ async def toggle_type_status(callback: CallbackQuery):
             [InlineKeyboardButton(text="📱 Лимит устройств", callback_data=f"edit_type_field_{type_id}_hwid_limit")],
             [InlineKeyboardButton(text="📄 Описание", callback_data=f"edit_type_field_{type_id}_description")],
             [InlineKeyboardButton(text="📋 Полное описание", callback_data=f"edit_type_field_{type_id}_full_description")],
+            [InlineKeyboardButton(text="🛡 Лимит белых списков", callback_data=f"edit_type_field_{type_id}_bs_limit_gb")],
             [InlineKeyboardButton(
                 text="🔄 Переключить статус",
                 callback_data=f"toggle_type_{type_id}"
@@ -749,6 +756,14 @@ async def process_field_edit(message: Message, state: FSMContext):
                 return
             # Переводим GB в байты
             value = int(value) * 1024 * 1024 * 1024
+    elif field == 'bs_limit_gb':
+        if value == '-':
+            value = None  # белые списки не входят в тариф
+        elif not value.isdigit() or int(value) <= 0:
+            await message.answer("❌ Введите положительное число ГБ или '-', если белые списки не входят в тариф!")
+            return
+        else:
+            value = int(value)
     # Валидация для остальных числовых полей
     elif field in ['days', 'price', 'hwid_limit']:
         if not value.isdigit() or int(value) <= 0:
@@ -779,6 +794,7 @@ async def process_field_edit(message: Message, state: FSMContext):
                     f"Лимит устройств: {tariff_type['hwid_limit']}\n"
                     f"Описание: {tariff_type['description'] or 'нет'}\n"
                     f"Полное описание: {'есть' if tariff_type.get('full_description') else 'нет'}\n"
+                    f"Белые списки: {str(tariff_type['bs_limit_gb']) + ' ГБ / 30 дней' if tariff_type.get('bs_limit_gb') else 'не входят'}\n"
                     f"Статус: {'✅ Активен' if tariff_type['is_active'] else '❌ Неактивен'}\n\n"
                     f"Что хотите изменить?"
                 )
@@ -790,6 +806,7 @@ async def process_field_edit(message: Message, state: FSMContext):
                                           callback_data=f"edit_type_field_{entity_id}_hwid_limit")],
                     [InlineKeyboardButton(text="📄 Описание", callback_data=f"edit_type_field_{entity_id}_description")],
                     [InlineKeyboardButton(text="📋 Полное описание", callback_data=f"edit_type_field_{entity_id}_full_description")],
+                    [InlineKeyboardButton(text="🛡 Лимит белых списков", callback_data=f"edit_type_field_{entity_id}_bs_limit_gb")],
                     [InlineKeyboardButton(
                         text="🔄 Переключить статус",
                         callback_data=f"toggle_type_{entity_id}"

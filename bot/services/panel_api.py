@@ -111,7 +111,8 @@ class PanelAPI:
             days: int = 30,
             hwid_limit: int = 3,
             tag: str = None,
-            traffic_limit_bytes: int = 0  # новый параметр, 0 = безлимит
+            traffic_limit_bytes: int = 0,  # новый параметр, 0 = безлимит
+            extra_squad_ids: Optional[List[str]] = None  # дополнительные сквады (например, белые списки)
     ) -> Optional[Dict[str, Any]]:
         """Create a new user with specific squad"""
         expire_at = (
@@ -133,7 +134,7 @@ class PanelAPI:
             # если есть лимит - сбрасываем monthly
             "hwidDeviceLimit": hwid_limit,
             "tag": tag,
-            "activeInternalSquads": [squad_id]
+            "activeInternalSquads": [squad_id] + [s for s in (extra_squad_ids or []) if s != squad_id]
         }
 
         logger.info(f"Creating user with payload: {payload}")
@@ -334,6 +335,98 @@ class PanelAPI:
 
         logger.error(f"❌ Failed to revoke subscription for {username}: {response}")
         return None
+
+    # ======================================================
+    # СКВАДЫ И ТРАФИК ПО СКВАДАМ
+    # ======================================================
+
+    async def get_all_users(self, page_size: int = 500) -> Optional[List[Dict[str, Any]]]:
+        """Все пользователи панели (с activeInternalSquads). None — панель не ответила."""
+        users, start = [], 0
+        while True:
+            response = await self._request("GET", "users", params={"size": page_size, "start": start})
+            if not response or response.get("error") or "response" not in response:
+                logger.error(f"❌ Failed to list users: {response}")
+                return None
+            page = response["response"].get("users", [])
+            users.extend(page)
+            start += len(page)
+            if not page or start >= response["response"].get("total", 0):
+                return users
+
+    async def get_internal_squads(self) -> Optional[List[Dict[str, Any]]]:
+        response = await self._request("GET", "internal-squads")
+        if response and not response.get("error") and "response" in response:
+            return response["response"].get("internalSquads", [])
+        return None
+
+    async def set_user_squads(self, username: str, squad_uuids: List[str]) -> bool:
+        """Заменить список внутренних сквадов пользователя"""
+        response = await self._request("PATCH", "users", json={
+            "username": username,
+            "activeInternalSquads": list(dict.fromkeys(squad_uuids))
+        })
+        if response is not None and not response.get("error"):
+            logger.info(f"🧩 Squads of {username} set to {squad_uuids}")
+            return True
+        logger.error(f"❌ Failed to set squads for {username}: {response}")
+        return False
+
+    async def get_squad_user_usage_bytes(self, squad_uuid: str, user_id: int, start: str, end: str) -> Optional[int]:
+        """
+        Трафик пользователя на всех нодах сквада за период (даты YYYY-MM-DD включительно).
+        Нод в скваде может быть несколько — панель сама суммирует по ним. None — нет ответа.
+        """
+        response = await self._request(
+            "GET", f"bandwidth-stats/internal-squads/{squad_uuid}/users/{user_id}/usage",
+            params={"start": start, "end": end}
+        )
+        if not response or response.get("error") or "response" not in response:
+            return None
+        return sum(
+            int(node.get("totalBytes") or 0)
+            for day in response["response"].get("days", [])
+            for node in day.get("nodes", [])
+        )
+
+    async def get_squad_usage(self, squad_uuid: str, start: str, end: str,
+                              min_total_bytes: int = 0) -> Optional[Dict[int, int]]:
+        """Трафик всех пользователей на нодах сквада за период: {id пользователя: байты}. None — нет ответа."""
+        result, cursor = {}, None
+        while True:
+            params = {"start": start, "end": end, "minTotalBytes": int(min_total_bytes), "limit": 1000}
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = await self._request("GET", f"bandwidth-stats/internal-squads/{squad_uuid}/usage", params=params)
+            if not response or response.get("error") or "response" not in response:
+                logger.error(f"❌ Failed to get squad usage: {response}")
+                return None
+            data = response["response"]
+            for user in data.get("users", []):
+                result[int(user["id"])] = int(user.get("totalBytes") or 0)
+            cursor = data.get("nextCursor")
+            if not data.get("hasMore") or cursor is None:
+                return result
+
+    async def add_users_to_squad(self, squad_uuid: str, user_ids: List[int]) -> bool:
+        ok = True
+        for i in range(0, len(user_ids), 1000):
+            response = await self._request(
+                "POST", f"internal-squads/{squad_uuid}/bulk-actions/add-many-users",
+                json={"userIds": user_ids[i:i + 1000]}
+            )
+            ok = ok and response is not None and not response.get("error")
+        return ok
+
+    async def remove_users_from_squad(self, squad_uuid: str, user_ids: List[int]) -> bool:
+        ok = True
+        for i in range(0, len(user_ids), 1000):
+            response = await self._request(
+                "DELETE", f"internal-squads/{squad_uuid}/bulk-actions/remove-many-users",
+                json={"userIds": user_ids[i:i + 1000]}
+            )
+            ok = ok and response is not None and not response.get("error")
+        return ok
 
     async def close(self):
         if self._session:
