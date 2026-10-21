@@ -2,7 +2,8 @@
 Возврат клиентов: автоматические сообщения и подарки тем, кто ушёл или так и не начал пользоваться.
 
 Сегменты (у каждого сообщения своё окно — давно ушедшим ничего не шлём):
-  winback        — платил, все подписки истекли: через 24 ч (до 7 дней) дарим RETENTION_GIFT_DAYS дней
+  winback        — платная подписка истекла (по каждой подписке отдельно: истекла Family при действующей
+                   Standart — тоже): через 24 ч (до 7 дней) дарим RETENTION_GIFT_DAYS дней к этой подписке
                    + RETENTION_GIFT_GB ГБ белых списков (бонусом, как за друга);
   trial_expired  — не платил, подписка (триал) истекла: через 24 ч рассказываем о подписке,
                    ещё через 24 ч — тот же подарок;
@@ -10,7 +11,7 @@
                    после окончания триала такой пользователь попадает в trial_expired;
   start_only     — нажал /start, подписок не было: цепочка 1 / 3 / 7 дней с предложением триала.
 
-Ограничения: подарок — не чаще раза в RETENTION_GIFT_COOLDOWN_DAYS (90) дней; не больше одного
+Ограничения: подарок по каждой подписке — не чаще раза в RETENTION_GIFT_COOLDOWN_DAYS (90) дней; не больше одного
 сообщения в сутки на человека; только с 10:00 до 21:00 МСК; забаненным и заблокировавшим бота не пишем;
 оплатил / подключился / вышел из окна — цепочка прекращается. Выключено по умолчанию (bot_settings).
 """
@@ -129,8 +130,9 @@ async def _send(bot, telegram_id: int, text: str, keyboard: InlineKeyboardMarkup
 # ПОДАРОК
 # ======================================================
 
-async def _gift_allowed(telegram_id: int, now: datetime) -> bool:
-    last = _utc(await retention_db.last_gift_time(telegram_id))
+async def _gift_allowed(subscription_id: int, now: datetime) -> bool:
+    """Подарок по этой подписке — не чаще раза в RETENTION_GIFT_COOLDOWN_DAYS (по каждой подписке отдельно)"""
+    last = _utc(await retention_db.last_gift_time(subscription_id))
     return last is None or now - last >= gift_cooldown()
 
 
@@ -177,51 +179,60 @@ async def _process_user(bot, panel_api, user: Dict[str, Any], now: datetime, tar
 
     active = [s for s in subs if (_utc(s["subscription_expiry"]) or now) > now]
 
-    # 3. Триал идёт, подключения нет — помощь на 1-й и 2-й день
-    if active:
-        if user["has_paid"]:
-            return None
+    # 3. Не платил, триал идёт, подключения нет — помощь на 1-й и 2-й день
+    if active and not user["has_paid"]:
         trial = next((s for s in active if s.get("trial_used")), None)
-        if not trial:
-            return None
-        day = int((now - (_utc(trial["created_at"]) or now)) // timedelta(days=1))
-        if day not in texts.TRIAL_IDLE_HELP:
-            return None
-        ref = f"{trial['id']}:d{day}"
-        if await retention_db.has_event(tid, "trial_idle", "help", ref):
-            return None
-        used = await panel_api.get_used_traffic_bytes(trial["username_in_panel"])
-        if used is None or used >= CONNECTED_BYTES:
-            return None  # нет данных или уже подключился
-        await retention_db.record_event(tid, "trial_idle", "help", ref, trial["id"])
-        await _send(bot, tid, texts.TRIAL_IDLE_HELP[day], _keyboard("trial_idle"))
-        return "trial_idle:help"
-
-    # Все подписки истекли
-    latest = max(subs, key=lambda s: _utc(s["subscription_expiry"]) or datetime.min.replace(tzinfo=timezone.utc))
-    expired_at = _utc(latest["subscription_expiry"])
-    if not expired_at:
+        if trial:
+            day = int((now - (_utc(trial["created_at"]) or now)) // timedelta(days=1))
+            ref = f"{trial['id']}:d{day}"
+            if day in texts.TRIAL_IDLE_HELP and not await retention_db.has_event(tid, "trial_idle", "help", ref):
+                used = await panel_api.get_used_traffic_bytes(trial["username_in_panel"])
+                if used is not None and used < CONNECTED_BYTES:  # нет данных или подключился — не пишем
+                    await retention_db.record_event(tid, "trial_idle", "help", ref, trial["id"])
+                    await _send(bot, tid, texts.TRIAL_IDLE_HELP[day], _keyboard("trial_idle"))
+                    return "trial_idle:help"
         return None
-    since = now - expired_at
-    ref = f"{latest['id']}:{latest['subscription_expiry']}"
-    ctx = await _context(tariffs.get(latest["id"], ""))
 
-    # 1. Платил и не продлил — подарок через 24 часа
-    if user["has_paid"]:
+    # Истёкшие подписки — каждая отдельно (истекла Family при действующей Standart — пишем про Family).
+    # Сначала самые свежие; за проход не больше одного сообщения, остальные — в следующие дни.
+    expired = sorted(
+        (s for s in subs if s not in active and _utc(s["subscription_expiry"])),
+        key=lambda s: _utc(s["subscription_expiry"]), reverse=True
+    )
+    for sub in expired:
+        result = await _process_expired(bot, panel_api, user, sub, now, tariffs, has_active=bool(active))
+        if result:
+            return result
+    return None
+
+
+async def _process_expired(bot, panel_api, user: Dict[str, Any], sub: Dict[str, Any], now: datetime,
+                           tariffs: Dict[int, str], has_active: bool) -> Optional[str]:
+    tid = user["telegram_id"]
+    since = now - _utc(sub["subscription_expiry"])
+    ref = f"{sub['id']}:{sub['subscription_expiry']}"
+    ctx = await _context(tariffs.get(sub["id"], ""))
+
+    # 1. Платная подписка (были оплаченные дни или дни от админа) не продлена — подарок через 24 часа
+    if sub.get("bs_paid_until"):
         if not (WINBACK_WINDOW[0] <= since < WINBACK_WINDOW[1]):
             return None
-        if await retention_db.has_event(tid, "winback", "gift", ref) or not await _gift_allowed(tid, now):
+        if await retention_db.has_event(tid, "winback", "gift", ref) or not await _gift_allowed(sub["id"], now):
             return None
-        if not await _gift(panel_api, latest):
+        if not await _gift(panel_api, sub):
             return None
-        await retention_db.record_event(tid, "winback", "gift", ref, latest["id"])
+        await retention_db.record_event(tid, "winback", "gift", ref, sub["id"])
         await _send(bot, tid, texts.WINBACK_GIFT.format(**ctx), _keyboard("winback"))
         return "winback:gift"
+
+    # Бесплатная подписка (триал, бонусы) у того, кто платил или ещё чем-то пользуется, — не трогаем
+    if user["has_paid"] or has_active:
+        return None
 
     # 2. Триал закончился, не купил: сначала рассказ о подписке, через сутки — подарок
     if TRIAL_PROMO_WINDOW[0] <= since < TRIAL_PROMO_WINDOW[1] \
             and not await retention_db.has_event(tid, "trial_expired", "promo", ref):
-        await retention_db.record_event(tid, "trial_expired", "promo", ref, latest["id"])
+        await retention_db.record_event(tid, "trial_expired", "promo", ref, sub["id"])
         await _send(bot, tid, texts.TRIAL_EXPIRED_PROMO.format(**ctx), _keyboard("trial_promo"))
         return "trial_expired:promo"
 
@@ -229,10 +240,10 @@ async def _process_user(bot, panel_api, user: Dict[str, Any], now: datetime, tar
     if (promo_at and TRIAL_GIFT_WINDOW[0] <= since < TRIAL_GIFT_WINDOW[1]
             and now - promo_at >= MIN_GAP
             and not await retention_db.has_event(tid, "trial_expired", "gift", ref)
-            and await _gift_allowed(tid, now)):
-        if not await _gift(panel_api, latest):
+            and await _gift_allowed(sub["id"], now)):
+        if not await _gift(panel_api, sub):
             return None
-        await retention_db.record_event(tid, "trial_expired", "gift", ref, latest["id"])
+        await retention_db.record_event(tid, "trial_expired", "gift", ref, sub["id"])
         await _send(bot, tid, texts.TRIAL_EXPIRED_GIFT.format(**ctx), _keyboard("trial_gift"))
         return "trial_expired:gift"
     return None

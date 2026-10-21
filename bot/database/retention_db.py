@@ -27,7 +27,8 @@ async def get_audience() -> List[Dict[str, Any]]:
         """) as cursor:
             users = [dict(row) for row in await cursor.fetchall()]
         async with db.execute("""
-            SELECT id, telegram_id, username_in_panel, subscription_expiry, trial_used, created_at, status
+            SELECT id, telegram_id, username_in_panel, subscription_expiry, trial_used, created_at, status,
+                   bs_paid_until
             FROM subscriptions WHERE status != 'DISABLED'
         """) as cursor:
             subs = defaultdict(list)
@@ -60,11 +61,12 @@ async def event_time(telegram_id: int, campaign: str, step: str, ref: str) -> Op
             return row[0] if row else None
 
 
-async def last_gift_time(telegram_id: int) -> Optional[str]:
+async def last_gift_time(subscription_id: int) -> Optional[str]:
+    """Когда последний раз дарили дни к этой подписке"""
     async with _connect() as db:
         async with db.execute(
-                "SELECT MAX(created_at) FROM retention_events WHERE telegram_id = ? AND step = 'gift'",
-                (telegram_id,)) as cursor:
+                "SELECT MAX(created_at) FROM retention_events WHERE subscription_id = ? AND step = 'gift'",
+                (subscription_id,)) as cursor:
             return (await cursor.fetchone())[0]
 
 

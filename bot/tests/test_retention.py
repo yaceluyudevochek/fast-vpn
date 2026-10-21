@@ -70,9 +70,12 @@ def user(path, tid, created_ago=timedelta(days=30)):
     sql(path, "INSERT INTO users (telegram_id, created_at) VALUES (?, ?)", (tid, ts(NOW - created_ago)))
 
 
-async def sub(path, tid, expiry, trial=False, created_ago=timedelta(days=10)):
-    sid = await db.create_subscription(tid, 1, 1, f"s{tid}-{expiry}", iso(expiry), f"tg{tid}_1", trial=trial)
-    sql(path, "UPDATE subscriptions SET created_at = ? WHERE id = ?", (ts(NOW - created_ago), sid))
+async def sub(path, tid, expiry, trial=False, created_ago=timedelta(days=10), paid=False, type_id=1):
+    """paid — у подписки были оплаченные дни (bs_paid_until), т. е. это платная подписка"""
+    sid = await db.create_subscription(tid, type_id, 1 if type_id == 1 else 4, f"s{tid}-{type_id}",
+                                       iso(expiry), f"tg{tid}_{type_id}", trial=trial)
+    sql(path, "UPDATE subscriptions SET created_at = ?, bs_paid_until = ? WHERE id = ?",
+        (ts(NOW - created_ago), ts(expiry) if paid else None, sid))
     return sid
 
 
@@ -169,8 +172,8 @@ async def test_winback():
     user(path, 2)
     pay(path, 1)
     pay(path, 2)
-    sid = await sub(path, 1, NOW - timedelta(hours=26))
-    await sub(path, 2, NOW - timedelta(days=10))                    # ушёл давно — не трогаем
+    sid = await sub(path, 1, NOW - timedelta(hours=26), paid=True)
+    await sub(path, 2, NOW - timedelta(days=10), paid=True)         # ушёл давно — не трогаем
     bot, panel = FakeBot(), FakePanel()
 
     assert await run(bot, panel, NOW) == {"winback:gift": 1}
@@ -183,6 +186,48 @@ async def test_winback():
     assert await run(bot, panel, later) == {}
     assert len(panel.extended) == 1
     print("OK  не продлил платную: через 24 ч +3 дня и +3 ГБ, не чаще раза в 3 месяца, давно ушедших не трогаем")
+
+
+async def test_several_subscriptions():
+    """Истекла Family при действующей Standart — подарок по Family; по каждой подписке свой подарок"""
+    path = await fresh_db()
+    user(path, 1)
+    pay(path, 1)
+    standart = await sub(path, 1, NOW + timedelta(days=20), paid=True, type_id=1)          # действует
+    family = await sub(path, 1, NOW - timedelta(hours=26), paid=True, type_id=2)           # истекла сутки назад
+    bot, panel = FakeBot(), FakePanel()
+
+    assert await run(bot, panel, NOW) == {"winback:gift": 1}
+    assert panel.extended == [("tg1_2", 3)] and "Premium" in bot.sent[-1][1]
+    assert (await db.get_subscription(family))["bs_bonus_bytes"] == 3 * whitelist.GB
+    assert (await db.get_subscription(standart))["bs_bonus_bytes"] == 0
+
+    # Через месяц истекает и Standart: подарок по ней — даже несмотря на недавний подарок по Family
+    later = NOW + timedelta(days=30)
+    sql(path, "UPDATE subscriptions SET subscription_expiry = ? WHERE id = ?", (iso(later - timedelta(hours=26)), standart))
+    sql(path, "UPDATE subscriptions SET subscription_expiry = ? WHERE id = ?", (iso(later + timedelta(days=5)), family))
+    assert await run(bot, panel, later) == {"winback:gift": 1}
+    assert panel.extended[-1] == ("tg1_1", 3) and "Default" in bot.sent[-1][1]
+
+    # Две подписки истекли одновременно — по одному сообщению в день, обе получают подарок
+    user(path, 2)
+    pay(path, 2)
+    await sub(path, 2, NOW - timedelta(hours=30), paid=True, type_id=1)
+    await sub(path, 2, NOW - timedelta(hours=26), paid=True, type_id=2)
+    panel.extended.clear()
+    assert await run(bot, panel, NOW) == {"winback:gift": 1}
+    assert await run(bot, panel, NOW + timedelta(hours=2)) == {}
+    assert await run(bot, panel, NOW + timedelta(days=1)) == {"winback:gift": 1}
+    assert sorted(panel.extended) == [("tg2_1", 3), ("tg2_2", 3)]
+
+    # У платящего клиента бесплатная подписка (бонусы за друзей) — подарков по ней нет
+    user(path, 3)
+    pay(path, 3)
+    await sub(path, 3, NOW + timedelta(days=20), paid=True, type_id=2)
+    await sub(path, 3, NOW - timedelta(hours=30), paid=False, type_id=1)
+    assert await run(bot, panel, NOW + timedelta(days=2)) == {}
+    print("OK  несколько подписок: истекла Family при живой Standart — подарок по Family; подарки по каждой подписке "
+          "отдельно; одна в день; бесплатная подписка платящего — без подарка")
 
 
 async def test_blocked_and_stats():
@@ -214,6 +259,7 @@ async def main():
     await test_trial_idle()
     await test_trial_expired_promo_then_gift()
     await test_winback()
+    await test_several_subscriptions()
     await test_blocked_and_stats()
 
 
