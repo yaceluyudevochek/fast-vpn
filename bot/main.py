@@ -22,6 +22,7 @@ from handlers import backup  # Импортируем новый модуль
 from handlers.promo import router as promo_router
 from handlers.admin_promo import router as admin_promo_router
 from handlers.admin_whitelist import router as admin_whitelist_router
+from handlers.admin_retention import router as admin_retention_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -58,6 +59,7 @@ async def main():
     dp.include_router(promo_router)
     dp.include_router(admin_promo_router)
     dp.include_router(admin_whitelist_router)
+    dp.include_router(admin_retention_router)
     dp.include_router(handlers.router)
     dp.include_router(payment_router)  # Новый роутер для платежей
 

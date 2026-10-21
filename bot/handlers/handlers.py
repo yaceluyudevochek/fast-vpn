@@ -10,6 +10,7 @@ from services.panel_api import PanelAPI
 from config.config import PANEL_API_URL, PANEL_API_KEY
 from database import db as database
 from database import promo_db
+from database import retention_db
 from services.promo import normalize_code
 from services.subscription_link import reissue_subscription_link
 from services import whitelist
@@ -114,6 +115,7 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
             logger.info(f"User {user.id} referred by {referred_by}")
 
     await database.add_user(user.id, user.username, referred_by)
+    await retention_db.set_bot_blocked(user.id, False)  # снова пишет боту — можно присылать уведомления
 
     await render_main_menu(message, user.id, user.first_name)
 

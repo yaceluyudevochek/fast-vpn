@@ -288,6 +288,24 @@ async def _m008_whitelist_bonus(db):
     await _add_column(db, "subscriptions", "bs_quota_limit", "INTEGER")
 
 
+async def _m009_retention(db):
+    """Возврат клиентов: журнал сообщений/подарков, блокировка бота пользователем, частота рассылки"""
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS retention_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            campaign TEXT NOT NULL,                       -- winback | trial_expired | trial_idle | start_only
+            step TEXT NOT NULL,                           -- promo | gift | help | d1 / d3 / d7
+            ref TEXT,                                     -- к чему относится (подписка и дата её окончания)
+            subscription_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_retention_user ON retention_events(telegram_id, campaign, step)")
+    await _add_column(db, "users", "bot_blocked_at", "TIMESTAMP")      # пользователь заблокировал бота
+    await _add_column(db, "users", "last_marketing_at", "TIMESTAMP")   # последнее маркетинговое сообщение
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -297,6 +315,7 @@ _MIGRATIONS = [
     (6, _m006_whitelist),
     (7, _m007_whitelist_warning),
     (8, _m008_whitelist_bonus),
+    (9, _m009_retention),
 ]
 
 

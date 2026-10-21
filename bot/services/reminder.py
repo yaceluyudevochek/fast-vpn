@@ -27,6 +27,7 @@ class SubscriptionReminder:
         # Храним информацию об отправленных уведомлениях
         self._sent_notifications: Dict[str, Dict] = {}
         self._last_whitelist_check = float("-inf")
+        self._last_retention_check = float("-inf")
 
     async def start(self):
         if self.is_running:
@@ -60,7 +61,22 @@ class SubscriptionReminder:
                 await self._check_whitelist()
             except Exception as e:
                 logger.error(f"Error in whitelist check: {e}", exc_info=True)
+            try:
+                await self._check_retention()
+            except Exception as e:
+                logger.error(f"Error in retention check: {e}", exc_info=True)
             await asyncio.sleep(self.check_interval)
+
+    async def _check_retention(self):
+        """Возврат клиентов: раз в RETENTION_CHECK_INTERVAL (сообщения только днём, см. services/retention.py)"""
+        from config import config
+        from services import retention
+
+        now = asyncio.get_running_loop().time()
+        if self.panel_api is None or now - self._last_retention_check < getattr(config, "RETENTION_CHECK_INTERVAL", 900):
+            return
+        self._last_retention_check = now
+        await retention.run(self.bot, self.panel_api)
 
     async def _check_whitelist(self):
         """Лимиты белых списков: раз в BS_CHECK_INTERVAL снимаем/возвращаем сквад БС"""

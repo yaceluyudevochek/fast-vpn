@@ -100,6 +100,7 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔗 Перевыпустить ссылку", callback_data="admin_revoke_link")],
         [InlineKeyboardButton(text="🛡 Белые списки", callback_data="admin_bs")],
         [InlineKeyboardButton(text="🧩 Сквады пользователя", callback_data="admin_user_squads")],
+        [InlineKeyboardButton(text="📣 Возврат клиентов", callback_data="admin_retention")],
         [InlineKeyboardButton(text="💾 Управление бэкапами", callback_data="admin_backup")],
         [InlineKeyboardButton(text="👑 Добавить администратора", callback_data="admin_add_admin")],
         [InlineKeyboardButton(text="🎟 Промокоды", callback_data="admin_promos")],
