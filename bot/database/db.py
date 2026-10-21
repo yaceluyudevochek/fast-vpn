@@ -275,6 +275,19 @@ async def _m007_whitelist_warning(db):
     await _add_column(db, "subscriptions", "bs_warned_period", "TEXT")
 
 
+async def _m008_whitelist_bonus(db):
+    """
+    Бонусные ГБ белых списков (за друзей; позже — пакеты): начислено / потрачено в закрытых квотах.
+    bs_quota_* — квота, которую бот сейчас отслеживает: при её смене трафик сверх обычного лимита
+    в закрывшейся квоте списывается из бонусов.
+    """
+    await _add_column(db, "subscriptions", "bs_bonus_bytes", "INTEGER NOT NULL DEFAULT 0")
+    await _add_column(db, "subscriptions", "bs_bonus_used", "INTEGER NOT NULL DEFAULT 0")
+    await _add_column(db, "subscriptions", "bs_quota_key", "TEXT")
+    await _add_column(db, "subscriptions", "bs_quota_start", "TIMESTAMP")
+    await _add_column(db, "subscriptions", "bs_quota_limit", "INTEGER")
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -283,6 +296,7 @@ _MIGRATIONS = [
     (5, _m005_link_revokes),
     (6, _m006_whitelist),
     (7, _m007_whitelist_warning),
+    (8, _m008_whitelist_bonus),
 ]
 
 
@@ -946,6 +960,26 @@ async def add_bs_paid_days(subscription_id: int, days: int, now: datetime, from_
             "UPDATE subscriptions SET bs_paid_until = ?, bs_period_anchor = ? WHERE id = ?",
             (_sql_ts(base + timedelta(days=days)), _sql_ts(anchor), subscription_id)
         )
+        await db.commit()
+
+
+async def add_bs_bonus(subscription_id: int, amount: int):
+    """Начислить бонусные байты белых списков"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE subscriptions SET bs_bonus_bytes = bs_bonus_bytes + ? WHERE id = ?",
+                         (int(amount), subscription_id))
+        await db.commit()
+
+
+async def close_bs_quota(subscription_id: int, bonus_spent: int, key: str, start: str, limit: int):
+    """Квота сменилась: списать потраченные в закрытой квоте бонусы и запомнить новую квоту"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE subscriptions
+            SET bs_bonus_used = MIN(bs_bonus_bytes, bs_bonus_used + ?),
+                bs_quota_key = ?, bs_quota_start = ?, bs_quota_limit = ?
+            WHERE id = ?
+        """, (int(bonus_spent), key, start, limit, subscription_id))
         await db.commit()
 
 

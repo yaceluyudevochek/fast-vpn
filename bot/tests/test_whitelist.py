@@ -398,6 +398,124 @@ async def test_warning():
     print("OK  предупреждение «осталось 20%»: один раз на квоту; тексты — когда обновится, «если продлить», «оплати подписку»")
 
 
+async def test_referral_bonus():
+    path = await fresh_db()
+    panel = FakePanel()
+    now = datetime.now(timezone.utc)
+
+    # Неплатящий: 3 ГБ + 7 ГБ за друга = 10 ГБ
+    u = await make_sub(path, 1, "farmer", anchor=now - timedelta(days=5))
+    panel.add("farmer", 101); panel.use(101, now, 4)
+    assert await whitelist.grant_referral_bonus(panel, u) == 7
+    result = await whitelist.check_all(panel)
+    assert result.exhausted == [] and BS in panel.squads("farmer")
+    assert whitelist.get_quota(await sub(u)).total == 10 * GB
+    text = whitelist.status_text(await whitelist.get_status(panel, await sub(u)))
+    assert "бонусные" in text and "осталось" in text, text
+
+    # Потратил всё — исчерпан; новый друг — доступ возвращается сразу, без ожидания проверки
+    panel.use(101, now, 7)
+    result = await whitelist.check_all(panel)
+    assert [s["telegram_id"] for s in result.exhausted] == [1] and BS not in panel.squads("farmer")
+    text = whitelist.status_text(await whitelist.get_status(panel, await sub(u)))
+    assert "исчерпаны" in text and "друг по твоей ссылке" in text, text
+    await whitelist.grant_referral_bonus(panel, u)
+    assert state(path, u) is None and BS in panel.squads("farmer")
+    text = whitelist.status_text(await whitelist.get_status(panel, await sub(u)))
+    assert "идут бонусные: осталось <b>6 из 14 ГБ</b>" in text, text
+
+    # Бонус начислен, когда доступ уже снят, — фоновая проверка тоже возвращает (и сообщает)
+    c = await make_sub(path, 2, "paid", anchor=now - timedelta(days=5), paid_until=now + timedelta(days=60))
+    panel.add("paid", 102); panel.use(102, now, 55)
+    result = await whitelist.check_all(panel)
+    assert [s["telegram_id"] for s in result.exhausted] == [2]
+    await db.add_bs_bonus(c, 7 * GB)
+    result = await whitelist.check_all(panel)
+    assert [s["telegram_id"] for s in result.restored] == [2] and BS in panel.squads("paid")
+    print("OK  бонус за друга: +7 ГБ поверх лимита (и для неплатящих), доступ возвращается сразу, не сгорает")
+
+
+async def test_bonus_spent_at_rollover():
+    path = await fresh_db()
+    panel = FakePanel()
+    sid = await make_sub(path, 1, "a", anchor=NOW - timedelta(days=20), paid_until=NOW + timedelta(days=90))
+    panel.add("a", 101)
+    await db.add_bs_bonus(sid, 14 * GB)
+    await whitelist.check_all(panel, NOW)                          # квота запомнена, бонусы не тронуты
+    panel.use(101, NOW, 60)                                        # 60 из 50 + 14
+    result = await whitelist.check_all(panel, NOW)
+    assert result.exhausted == [] and BS in panel.squads("a")
+
+    # Новый период: потраченные сверх лимита 10 ГБ списываются из бонусов, остаётся 4 ГБ
+    later = NOW + timedelta(days=10, hours=1)
+    await whitelist.check_all(panel, later)
+    s = await sub(sid)
+    assert s["bs_bonus_used"] == 10 * GB, s["bs_bonus_used"] / GB
+    assert whitelist.get_quota(s, later).total == 54 * GB
+    await whitelist.check_all(panel, later)                        # повторная проверка ничего не списывает
+    assert (await sub(sid))["bs_bonus_used"] == 10 * GB
+
+    # Период «без лимита» от админа бонусы не тратит
+    b = await make_sub(path, 2, "b", anchor=NOW - timedelta(days=20), paid_until=NOW + timedelta(days=90))
+    panel.add("b", 102)
+    await db.add_bs_bonus(b, 14 * GB)
+    await whitelist.check_all(panel, NOW)
+    assert await whitelist.admin_set_user_squad(panel, await sub(b), BS, True)
+    sql(path, "UPDATE subscriptions SET bs_state_period = ? WHERE id = ?",
+        (whitelist.get_quota(await sub(b), NOW).key, b))
+    panel.use(102, NOW, 200)
+    await whitelist.check_all(panel, later)
+    assert (await sub(b))["bs_bonus_used"] == 0
+    print("OK  бонусы списываются только на трафик сверх лимита закрывшейся квоты, один раз; «без лимита» их не тратит")
+
+
+async def test_reward_referrer():
+    from types import SimpleNamespace
+    from handlers import handlers
+
+    class ReferralPanel(FakePanel):
+        async def extend_subscription_by_username(self, username, days, traffic_limit_bytes=None):
+            return FUTURE
+
+        async def create_user(self, username, telegram_id, squad_id, days=30, hwid_limit=3, tag=None,
+                              traffic_limit_bytes=0, extra_squad_ids=None):
+            self.add(username, 500 + len(self.users), squads=[squad_id] + list(extra_squad_ids or []))
+            return {"shortUuid": f"su-{username}", "expireAt": FUTURE, "subscriptionUrl": "https://sub/x"}
+
+    path = await fresh_db()
+    panel = ReferralPanel()
+    handlers.panel_api = panel
+    tariff_type = await db.get_tariff_type(1)
+    plan = (await db.get_tariff_plans(1))[0]
+
+    # У пригласившего есть базовая подписка: +7 дней и +7 ГБ к ней
+    sql(path, "INSERT INTO users (telegram_id, referrals_activated) VALUES (10, 0)")
+    base = await make_sub(path, 10, "tg10_1")
+    panel.add("tg10_1", 110)
+    sql(path, "INSERT INTO users (telegram_id, referred_by) VALUES (20, 10)")
+    bot = FakeBot()
+    await handlers.reward_referrer(bot, SimpleNamespace(id=20, first_name="Друг"), tariff_type, plan)
+    assert (await sub(base))["bs_bonus_bytes"] == 7 * GB
+    assert sql(path, "SELECT referrals_activated FROM users WHERE telegram_id = 10")[0][0] == 1
+    assert bot.sent[0][0] == 10 and "+7 дней" in bot.sent[0][1] and "+7 ГБ</b> к белым спискам" in bot.sent[0][1]
+
+    # Базовой подписки нет: создаётся (со сквадом БС) и сразу получает бонус
+    sql(path, "INSERT INTO users (telegram_id) VALUES (30)")
+    sql(path, "INSERT INTO users (telegram_id, referred_by) VALUES (40, 30)")
+    await handlers.reward_referrer(bot, SimpleNamespace(id=40, first_name="Друг"), tariff_type, plan)
+    created = (await db.get_user_subscriptions(30))[0]
+    assert created["username_in_panel"] == "tg30_1" and created["bs_bonus_bytes"] == 7 * GB
+    assert BS in panel.squads("tg30_1")
+
+    # БС выключены: бонус всё равно копится, но в сообщении о нём не говорим
+    await whitelist.set_enabled(False)
+    sql(path, "INSERT INTO users (telegram_id, referred_by) VALUES (50, 10)")
+    await handlers.reward_referrer(bot, SimpleNamespace(id=50, first_name="Друг"), tariff_type, plan)
+    assert (await sub(base))["bs_bonus_bytes"] == 14 * GB
+    assert "белым спискам" not in bot.sent[-1][1] and "+7 дней" in bot.sent[-1][1]
+    print("OK  награда за друга: +7 дней и +7 ГБ к базовой подписке (создаётся, если нет); при выключенных БС копится молча")
+
+
 async def test_status_text():
     path = await fresh_db()
     panel = FakePanel()
@@ -470,6 +588,9 @@ async def main():
     await test_question_referral_farmer()
     await test_payment_and_admin()
     await test_warning()
+    await test_referral_bonus()
+    await test_bonus_spent_at_rollover()
+    await test_reward_referrer()
     await test_status_text()
     await test_migration()
 
