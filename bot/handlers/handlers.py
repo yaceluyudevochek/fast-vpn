@@ -49,7 +49,7 @@ async def render_main_menu(target, user_id: int, first_name: str):
     text = (
         f"{E['wave']} <b>Привет, {first_name}!</b>\n\n"
         f"{status_line}\n\n"
-        f"Выбери действие ниже {E['sparkle']}"
+        f"Выбери действие ниже"
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -80,7 +80,7 @@ async def show_info_menu(callback: CallbackQuery):
         f"{E['info']} <b>Информация</b>\n\n"
         "Используя сервис, ты подтверждаешь, что ознакомлен "
         "с настоящим соглашением и принимаешь его условия в полном объёме.\n\n"
-        f"Выбери раздел ниже {E['bulb']}"
+        f"Выбери раздел ниже"
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -150,7 +150,7 @@ async def show_tariff_types(callback: CallbackQuery):
 
     text = (
         f"{E['tag']} <b>Выбери тип подписки</b>\n\n"
-        f"Каждый тип имеет свои тарифные планы {E['sparkle']}"
+        f"Каждый тип имеет свои тарифные планы"
     )
 
     await show_screen(callback, "buy", text, InlineKeyboardMarkup(inline_keyboard=keyboard))
@@ -190,7 +190,7 @@ async def show_plans_for_type(callback: CallbackQuery):
         f"{E['diamond']} <b>{tariff_type['name']}</b>\n\n"
         f"{E['shield']} Лимит устройств: <b>{tariff_type['hwid_limit']}</b>\n"
         f"{(chr(10) + details + chr(10)) if details else ''}\n"
-        f"Выбери срок подписки {E['calendar']}"
+        f"Выбери срок подписки"
     )
 
     await show_screen(callback, "tariffs", text, InlineKeyboardMarkup(inline_keyboard=keyboard))
@@ -256,7 +256,7 @@ async def render_select_plan(target, user_id: int, plan_id: int, state: FSMConte
             "• Счётчик трафика будет обнулён\n\n"
         )
 
-    text += f"Для оформления нажми «Оплатить» {E['sparkle']}"
+    text += f"Для оформления нажми «Оплатить»"
 
     await show_screen(target, "payment", text, keyboard)
     return None
@@ -635,7 +635,7 @@ async def my_subscriptions(callback: CallbackQuery):
     if not subscriptions:
         text = (
             f"{E['drop']} У тебя пока нет подписок.\n\n"
-            f"Активируй триал или оформи подписку {E['gift']}"
+            f"Активируй триал или оформи подписку"
         )
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [kb_button("back", "Назад", callback_data="back_to_main")]
@@ -656,7 +656,7 @@ async def my_subscriptions(callback: CallbackQuery):
 
     text = (
         f"{E['shield']} <b>Твои подписки</b>\n\n"
-        f"Выбери подписку для управления {E['sparkle']}"
+        f"Выбери подписку для управления"
     )
 
     await show_screen(callback, "subs", text, InlineKeyboardMarkup(inline_keyboard=keyboard))

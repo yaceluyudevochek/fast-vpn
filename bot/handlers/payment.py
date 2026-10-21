@@ -104,7 +104,7 @@ async def choose_payment_method(callback: CallbackQuery, state: FSMContext):
         text += f"{E['info']} <b>Информация:</b> это тариф с ограничением по трафику.\n"
         text += "При исчерпании лимита доступ будет заблокирован до продления.\n\n"
 
-    text += f"Выбери способ оплаты {E['sparkle']}"
+    text += f"Выбери способ оплаты"
 
     await show_screen(callback, "payment", text, keyboard)
     await callback.answer()
@@ -237,7 +237,7 @@ async def process_payment_method(callback: CallbackQuery, state: FSMContext):
             f"{E['calendar']} Срок: <b>{plan['days']} дней</b>\n"
             f"{E['chart']} Трафик: <b>{traffic_text}</b>\n"
             f"{E['clock']} Счёт действителен: <b>{expires_in}</b>\n\n"
-            f"Нажми кнопку ниже для оплаты — подписка активируется автоматически {E['sparkle']}",
+            f"Нажми кнопку ниже для оплаты — подписка активируется автоматически",
             keyboard
         )
     else:
