@@ -11,11 +11,12 @@ async def main():
     from handlers.admin_promo import router as admin_promo_router
     from handlers.admin_whitelist import router as admin_whitelist_router
     from handlers.admin_retention import router as admin_retention_router
+    from handlers.admin_abuse import router as admin_abuse_router
     from handlers.payment import router as payment_router
     from handlers.promo import router as promo_router
 
     dp = Dispatcher()
-    for router in (backup.router, admin.router, promo_router, admin_promo_router, admin_whitelist_router, admin_retention_router, handlers.router, payment_router):
+    for router in (backup.router, admin.router, promo_router, admin_promo_router, admin_whitelist_router, admin_retention_router, admin_abuse_router, handlers.router, payment_router):
         dp.include_router(router)
 
     callback_handlers = sum(len(r.callback_query.handlers) for r in dp.sub_routers)

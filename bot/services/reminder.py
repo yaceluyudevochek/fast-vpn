@@ -28,6 +28,7 @@ class SubscriptionReminder:
         self._sent_notifications: Dict[str, Dict] = {}
         self._last_whitelist_check = float("-inf")
         self._last_retention_check = float("-inf")
+        self._last_abuse_check = float("-inf")
 
     async def start(self):
         if self.is_running:
@@ -65,7 +66,22 @@ class SubscriptionReminder:
                 await self._check_retention()
             except Exception as e:
                 logger.error(f"Error in retention check: {e}", exc_info=True)
+            try:
+                await self._check_abuse()
+            except Exception as e:
+                logger.error(f"Error in abuse check: {e}", exc_info=True)
             await asyncio.sleep(self.check_interval)
+
+    async def _check_abuse(self):
+        """Оповещения админам о «плохишах» (трафик, общие устройства/IP) — раз в ABUSE_CHECK_INTERVAL"""
+        from config import config
+        from services import abuse
+
+        now = asyncio.get_running_loop().time()
+        if self.panel_api is None or now - self._last_abuse_check < getattr(config, "ABUSE_CHECK_INTERVAL", 3600):
+            return
+        self._last_abuse_check = now
+        await abuse.run(self.bot, self.panel_api)
 
     async def _check_retention(self):
         """Возврат клиентов: раз в RETENTION_CHECK_INTERVAL (сообщения только днём, см. services/retention.py)"""

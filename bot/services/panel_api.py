@@ -408,6 +408,42 @@ class PanelAPI:
             if not data.get("hasMore") or cursor is None:
                 return result
 
+    async def get_nodes(self) -> Optional[List[Dict[str, Any]]]:
+        response = await self._request("GET", "nodes")
+        if response and not response.get("error") and "response" in response:
+            return response["response"]
+        return None
+
+    async def get_users_traffic(self, start: str, end: str, limit: int = 100) -> Optional[List[Dict[str, Any]]]:
+        """
+        Топ пользователей по трафику на всех нодах за период (даты YYYY-MM-DD включительно):
+        [{"username": ..., "total": байты}]. None — панель не ответила.
+        """
+        nodes = await self.get_nodes()
+        if not nodes:
+            return None
+        response = await self._request(
+            "POST", "bandwidth-stats/nodes/users",
+            params={"start": start, "end": end, "topUsersLimit": limit},
+            json={"nodesUuids": [n["uuid"] for n in nodes]}
+        )
+        if response and not response.get("error") and "response" in response:
+            return response["response"].get("topUsers", [])
+        return None
+
+    async def get_all_hwid_devices(self, page_size: int = 1000) -> Optional[List[Dict[str, Any]]]:
+        """Все HWID-устройства всех пользователей (hwid, userId, platform, deviceModel, requestIp, ...)"""
+        devices, start = [], 0
+        while True:
+            response = await self._request("GET", "hwid/devices", params={"start": start, "size": page_size})
+            if not response or response.get("error") or "response" not in response:
+                return None
+            page = response["response"].get("devices", [])
+            devices.extend(page)
+            start += len(page)
+            if not page or start >= response["response"].get("total", 0):
+                return devices
+
     async def add_users_to_squad(self, squad_uuid: str, user_ids: List[int]) -> bool:
         ok = True
         for i in range(0, len(user_ids), 1000):

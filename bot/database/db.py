@@ -306,6 +306,23 @@ async def _m009_retention(db):
     await _add_column(db, "users", "last_marketing_at", "TIMESTAMP")   # последнее маркетинговое сообщение
 
 
+async def _m010_abuse(db):
+    """Оповещения админам о «плохишах»: что уже сообщали и кого игнорировать"""
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS abuse_alerts (
+            key TEXT PRIMARY KEY,                         -- что именно сообщили (вид, пользователь/группа, период)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS abuse_ignore (
+            telegram_id INTEGER PRIMARY KEY,
+            added_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -316,6 +333,7 @@ _MIGRATIONS = [
     (7, _m007_whitelist_warning),
     (8, _m008_whitelist_bonus),
     (9, _m009_retention),
+    (10, _m010_abuse),
 ]
 
 
@@ -477,6 +495,8 @@ async def add_user(telegram_id: int, username: str, referred_by: int | None = No
             (telegram_id, username, ref_code, referred_by)
             VALUES (?, ?, ?, ?)
                          """, (telegram_id, username, ref_code, referred_by))
+        # username в Telegram мог смениться — храним актуальный (нужен для поиска в админке)
+        await db.execute("UPDATE users SET username = ? WHERE telegram_id = ?", (username, telegram_id))
 
         await db.commit()
 
