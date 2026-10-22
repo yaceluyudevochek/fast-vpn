@@ -164,7 +164,13 @@ async def test_bonus_days_and_archive():
     sid = await std_sub(path, panel)
     assert await tariffs.bonus_days(await db.get_subscription(sid), 7) == 7
     await tariffs.switch(panel, sid, 2)
-    assert abs(await tariffs.bonus_days(await db.get_subscription(sid), 7) - 7 * 200 / 300) < 1e-9
+    assert await tariffs.bonus_days(await db.get_subscription(sid), 7) == 5          # 4.67 → вверх до 5
+    sql(path, "UPDATE tariff_types SET switch_coef = 350 WHERE id = 2")
+    assert await tariffs.bonus_days(await db.get_subscription(sid), 7) == 4          # 7 × 200 / 350 = 4.0 ровно
+    sql(path, "UPDATE tariff_types SET switch_coef = 300 WHERE id = 2")
+    # На экране смены тарифа — вниз: 7.5 дня показываем как «7 дней» (реально начислится 7.5)
+    assert tariffs.days_text(timedelta(days=7.5)) == "7 дней" and tariffs.days_text(timedelta(days=21)) == "21 день"
+    assert tariffs.days_text(timedelta(hours=5)) == "меньше дня" and tariffs.plural_days(2) == "2 дня"
     assert await tariffs.bonus_days(None, 7) == 7
 
     # Миграция: у кого несколько подписок — оставляем на активном тарифе с самым поздним сроком, остальные в архив
@@ -181,7 +187,7 @@ async def test_bonus_days_and_archive():
     assert [r[0] for r in sql(path2, "SELECT id FROM subscriptions ORDER BY id")] == [keep, single]
     assert [r[0] for r in sql(path2, "SELECT id FROM subscriptions_archive")] == [old]
     assert (await db.get_user_main_subscription(5))["id"] == keep
-    print("OK  бонусные дни в днях Standart пересчитываются в тариф подписки; лишние подписки уходят в архив")
+    print("OK  бонусные дни Standart → тариф подписки с округлением вверх, экран смены — вниз; лишние подписки уходят в архив")
 
 
 async def test_referral_to_family():
@@ -201,7 +207,7 @@ async def test_referral_to_family():
     assert await referrals.grant(bot, panel, 1, "Друг") == sid
     assert len(await db.get_user_subscriptions(1)) == 1                       # новая подписка не создана
     username, days = panel.extended[0]
-    assert username == "tg1_1" and abs(days - 7 * 200 / 300) < 1e-9          # 7 дней Standart → ≈4.7 дня Family
+    assert username == "tg1_1" and days == 5                                   # 7 дней Standart → 4.67 → 5 Family
     assert "+5 дней тарифа Family" in bot.sent[-1], bot.sent[-1]
     print("OK  награда за друга идёт на единственную подписку (Family), дни пересчитаны по коэффициенту")
 

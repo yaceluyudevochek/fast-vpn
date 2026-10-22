@@ -49,6 +49,11 @@ TRIAL_GIFT_WINDOW = (timedelta(hours=48), timedelta(days=8))
 START_ONLY_STEPS = [(1, 3), (3, 7), (7, 14)]   # (день, до какого дня ещё актуально)
 
 
+def _days_word(days: int) -> str:
+    from services.tariffs import plural_days
+    return plural_days(int(days))
+
+
 def gift_days() -> int:
     return getattr(config, "RETENTION_GIFT_DAYS", 3)
 
@@ -105,7 +110,7 @@ def _keyboard(kind: str) -> InlineKeyboardMarkup:
 async def _context(tariff: str = "") -> Dict[str, Any]:
     gb = gift_gb()
     bs = f" и {whitelist.format_gb(int(gb * whitelist.GB))} ГБ белых списков" if gb > 0 and await whitelist.is_enabled() else ""
-    return {"tariff": tariff, "gift_days": gift_days(), "gift_bs": bs,
+    return {"tariff": tariff, "gift_days": _days_word(gift_days()), "gift_bs": bs,
             "min_price": await retention_db.min_month_price() or "—"}
 
 
@@ -136,14 +141,14 @@ async def _gift_allowed(subscription_id: int, now: datetime) -> bool:
     return last is None or now - last >= gift_cooldown()
 
 
-async def _gift(panel_api, sub: Dict[str, Any]) -> bool:
-    """Продлить подписку на подарочные дни и начислить бонусные ГБ белых списков"""
+async def _gift(panel_api, sub: Dict[str, Any]) -> Optional[int]:
+    """Продлить подписку на подарочные дни и начислить бонусные ГБ белых списков. Возвращает начисленные дни."""
     from services import tariffs
     days = await tariffs.bonus_days(await db.get_subscription(sub["id"]), gift_days())   # дни Standart → дни тарифа
     new_expiry = await panel_api.extend_subscription_by_username(sub["username_in_panel"], days)
     if not new_expiry:
         logger.error(f"Возврат клиентов: не удалось продлить {sub['username_in_panel']} в панели")
-        return False
+        return None
     await db.update_subscription_expiry(sub["id"], new_expiry)
     await db.update_subscription_status(sub["id"], "ACTIVE")
     if gift_gb() > 0:
@@ -151,7 +156,7 @@ async def _gift(panel_api, sub: Dict[str, Any]) -> bool:
             await whitelist.grant_bonus(panel_api, sub["id"], int(gift_gb() * whitelist.GB))
         except Exception as e:
             logger.error(f"Возврат клиентов: не удалось начислить бонус БС подписке {sub['id']}: {e}")
-    return True
+    return days
 
 
 # ======================================================
@@ -221,10 +226,11 @@ async def _process_expired(bot, panel_api, user: Dict[str, Any], sub: Dict[str, 
             return None
         if await retention_db.has_event(tid, "winback", "gift", ref) or not await _gift_allowed(sub["id"], now):
             return None
-        if not await _gift(panel_api, sub):
+        days = await _gift(panel_api, sub)
+        if not days:
             return None
         await retention_db.record_event(tid, "winback", "gift", ref, sub["id"])
-        await _send(bot, tid, texts.WINBACK_GIFT.format(**ctx), _keyboard("winback"))
+        await _send(bot, tid, texts.WINBACK_GIFT.format(**{**ctx, "gift_days": _days_word(days)}), _keyboard("winback"))
         return "winback:gift"
 
     # Бесплатная подписка (триал, бонусы) у того, кто платил или ещё чем-то пользуется, — не трогаем
@@ -243,10 +249,11 @@ async def _process_expired(bot, panel_api, user: Dict[str, Any], sub: Dict[str, 
             and now - promo_at >= MIN_GAP
             and not await retention_db.has_event(tid, "trial_expired", "gift", ref)
             and await _gift_allowed(sub["id"], now)):
-        if not await _gift(panel_api, sub):
+        days = await _gift(panel_api, sub)
+        if not days:
             return None
         await retention_db.record_event(tid, "trial_expired", "gift", ref, sub["id"])
-        await _send(bot, tid, texts.TRIAL_EXPIRED_GIFT.format(**ctx), _keyboard("trial_gift"))
+        await _send(bot, tid, texts.TRIAL_EXPIRED_GIFT.format(**{**ctx, "gift_days": _days_word(days)}), _keyboard("trial_gift"))
         return "trial_expired:gift"
     return None
 

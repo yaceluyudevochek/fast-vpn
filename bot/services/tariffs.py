@@ -3,8 +3,9 @@
 
 Формула: новый срок = остаток × коэффициент текущего тарифа / коэффициент нового.
 Коэффициент — поле тарифа в админке (switch_coef), по умолчанию цена 30-дневного плана.
-Остаток считается с точностью до секунды (а не до дней), чтобы сменой тарифа туда-обратно
-нельзя было накрутить дни на округлении; человеку показываем округлённые дни.
+Остаток при смене тарифа считается с точностью до секунды (а не до дней), чтобы сменой тарифа
+туда-обратно нельзя было накрутить дни на округлении; на экране — дни, округлённые вниз.
+Бонусные дни (за друга, подарки, триал) округляются вверх до целых — и начисляем, и пишем целое число.
 
 - Оплаченные и бесплатные (бонусные) дни пересчитываются по отдельности, оплаченный срок
   белых списков (bs_paid_until) сдвигается соответственно; период и потраченный трафик белых
@@ -17,6 +18,7 @@
   по коэффициенту в тариф подписки.
 """
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -46,12 +48,16 @@ def sql_ts(moment: datetime) -> str:
 
 
 def days_text(delta: timedelta) -> str:
+    """Дни для экранов смены тарифа — округление вниз (обещаем не больше, чем начислится)"""
     days = delta.total_seconds() / 86400
     if days <= 0:
         return "0 дней"
     if days < 1:
         return "меньше дня"
-    n = int(days + 0.5)
+    return plural_days(int(days + 1e-6))
+
+
+def plural_days(n: int) -> str:
     word = "день" if n % 10 == 1 and n % 100 != 11 else ("дня" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "дней")
     return f"{n} {word}"
 
@@ -150,9 +156,12 @@ async def switch(panel_api, subscription_id: int, new_type_id: int, now: Optiona
     return await db.get_subscription(subscription_id)
 
 
-async def bonus_days(subscription: Optional[Dict[str, Any]], days: float) -> float:
-    """Бонусные дни (заданы в днях базового тарифа) в днях тарифа подписки"""
+async def bonus_days(subscription: Optional[Dict[str, Any]], days: float) -> int:
+    """
+    Бонусные дни (заданы в днях базового тарифа) в днях тарифа подписки,
+    округлённые вверх до целых: начисляем и пишем в уведомлении одно и то же число.
+    """
     if not subscription or subscription["tariff_type_id"] == BASE_TARIFF_ID:
-        return days
+        return math.ceil(days)
     r = await ratio(BASE_TARIFF_ID, subscription["tariff_type_id"])
-    return days * r if r else days
+    return math.ceil(days * r - 1e-9) if r else math.ceil(days)

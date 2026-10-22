@@ -80,7 +80,7 @@ async def grant(bot, panel_api, referrer_id: int, friend_name: str) -> Optional[
         base_id = referrer_sub['id']
         days = await tariffs.bonus_days(referrer_sub, REFERRAL_BONUS_DAYS)
         if referrer_sub['tariff_type_id'] != tariffs.BASE_TARIFF_ID:
-            days_label = f"+{tariffs.days_text(timedelta(days=days))} тарифа {html.escape(referrer_sub['tariff_name'])}"
+            days_label = f"+{tariffs.plural_days(days)} тарифа {html.escape(referrer_sub['tariff_name'])}"
         new_expiry = await panel_api.extend_subscription_by_username(referrer_sub['username_in_panel'], days)
         if new_expiry:
             await database.update_subscription_expiry(base_id, new_expiry)

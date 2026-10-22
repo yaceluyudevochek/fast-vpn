@@ -481,7 +481,7 @@ async def activate_trial(callback: CallbackQuery):
 
             text = (
                 f"{E['check']} <b>Пробный период активирован!</b>\n\n"
-                f"{E['calendar']} К текущей подписке добавлено <b>+{tariffs.days_text(timedelta(days=trial_days))}</b>\n"
+                f"{E['calendar']} К текущей подписке добавлено <b>+{tariffs.plural_days(trial_days)}</b>\n"
                 f"{E['calendar']} Новая дата окончания: <b>{formatted_date}</b>\n"
                 f"{E['link']} Ссылка для подключения:\n"
                 f"{link}"

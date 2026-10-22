@@ -198,15 +198,15 @@ async def test_gift_on_other_tariff():
 
     assert await run(bot, panel, NOW) == {"winback:gift": 1}
     username, days = panel.extended[-1]
-    assert username == "tg1_2" and abs(days - 3 * 150 / 300) < 1e-9                       # 3 дня Standart → 1.5 Family
-    assert "Premium" in bot.sent[-1][1]
+    assert username == "tg1_2" and days == 2                                                 # 3 дня Standart → 1.5 → 2 Family
+    assert "Premium" in bot.sent[-1][1] and "Мы подарили тебе 2 дня" in bot.sent[-1][1]
     assert (await db.get_subscription(family))["bs_bonus_bytes"] == 3 * whitelist.GB         # ГБ — фиксированные
 
     # Подарок по подписке — не чаще раза в 3 месяца
     later = NOW + timedelta(days=4, hours=2)
     sql(path, "UPDATE subscriptions SET subscription_expiry = ? WHERE id = ?", (iso(later - timedelta(hours=26)), family))
     assert await run(bot, panel, later) == {}
-    print("OK  подарок на тарифе Family: дни пересчитаны по коэффициенту (3 → 1.5), ГБ фиксированные, раз в 3 месяца")
+    print("OK  подарок на тарифе Family: дни пересчитаны по коэффициенту и округлены вверх (3 → 1.5 → 2), ГБ фиксированные, раз в 3 месяца")
 
 
 async def test_blocked_and_stats():
