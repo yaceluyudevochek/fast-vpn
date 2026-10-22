@@ -5,6 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import html
 import logging
+import re
 from datetime import datetime, timedelta
 
 from services.panel_api import PanelAPI
@@ -35,6 +36,30 @@ panel_api = PanelAPI(PANEL_API_URL, PANEL_API_KEY)
 def _expiry_of(subscription: dict):
     value = subscription.get('subscription_expiry')
     return datetime.fromisoformat(value.replace('Z', '+00:00')) if value else None
+
+
+CAPTION_LIMIT = 1024  # подпись к картинке в Telegram (считаются символы без HTML-разметки)
+
+
+def _caption_len(text: str) -> int:
+    return len(html.unescape(re.sub(r"<[^>]+>", "", text)))
+
+
+def _description_block(tariff_type: dict, rest: str) -> str:
+    """
+    Описание тарифа для экрана, где остальной текст — rest: полное, если влезает в подпись,
+    иначе короткое, иначе ничего
+    """
+    for details in (tariff_type.get('full_description'), tariff_type.get('description')):
+        block = f"{details}\n\n" if details else ""
+        if block and _caption_len(block + rest) <= CAPTION_LIMIT:
+            return block
+    return ""
+
+
+def _is_paid_subscription(subscription: dict) -> bool:
+    """Были ли у подписки оплаченные дни (иначе это триал / бонусные дни)"""
+    return bool(subscription.get('bs_paid_until'))
 
 
 def _left_text(expiry) -> str:
@@ -382,7 +407,13 @@ async def _render_renew(callback: CallbackQuery, subscription: dict, back_to: st
         keyboard.append([kb_button("calendar", button_text, callback_data=f"renew_plan_{plan['id']}_{subscription_id}")])
 
     if len(await database.get_all_tariff_types()) > 1:
-        keyboard.append([kb_button("reset", "Сменить тариф", callback_data=f"switch_tariff_{subscription_id}")])
+        expiry = _expiry_of(subscription)
+        expired = not expiry or expiry <= datetime.now(expiry.tzinfo)
+        if expired or not _is_paid_subscription(subscription):
+            # Триал или подписка закончилась — человек выбирает, что купить: показываем все тарифы с описаниями
+            keyboard.append([kb_button("tag", "Другие тарифы", callback_data="show_tariffs")])
+        else:
+            keyboard.append([kb_button("reset", "Сменить тариф", callback_data=f"switch_tariff_{subscription_id}")])
     keyboard.append([kb_button("back", "Назад", callback_data=back_to)])
 
     # Определяем статус для отображения
@@ -944,8 +975,8 @@ async def switch_tariff_confirm(callback: CallbackQuery):
         await callback.answer("❌ Тариф недоступен", show_alert=True)
         return
 
+    title = f"{E['repeat']} <b>Перейти на {pv.new_type['name']}?</b>\n\n"
     text = (
-        f"{E['repeat']} <b>Перейти на {pv.new_type['name']}?</b>\n\n"
         f"Сейчас: <b>{pv.old_type['name']}</b> — {await _tariff_line(pv.old_type)}, "
         f"осталось <b>{tariffs.days_text(pv.remaining_old)}</b>\n"
         f"Станет: <b>{pv.new_type['name']}</b> — {await _tariff_line(pv.new_type)}, "
@@ -956,6 +987,8 @@ async def switch_tariff_confirm(callback: CallbackQuery):
         text += (f"{E['warn']} В новом тарифе меньше устройств, поэтому все подключённые устройства будут сброшены — "
                  f"подключи заново нужные (не больше {pv.new_type['hwid_limit']}).\n\n")
     text += "Ссылка подписки останется прежней. Сменить тариф снова можно будет через сутки."
+    # Описание нового тарифа — сразу под заголовком: здесь человек решает, переходить ли
+    text = title + _description_block(pv.new_type, title + text) + text
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [kb_button("confirm", "Сменить тариф", callback_data=f"switch_do_{sub_id}_{type_id}")],

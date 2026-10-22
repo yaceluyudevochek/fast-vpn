@@ -111,8 +111,20 @@ async def main():
     # Продлить: планы текущего тарифа, картинка «продлить»; без подписки — тарифы
     await handlers.renew_main(FakeCallback(2))
     image, text, kb = screens[-1]
-    assert image == "renew" and any(c.startswith("renew_plan_") for c in callbacks(kb)) and "Сменить тариф" in buttons(kb)
+    assert image == "renew" and any(c.startswith("renew_plan_") for c in callbacks(kb))
     assert callbacks(kb)[-1] == "back_to_main"                                   # из меню — назад в меню
+    # Триал (оплаченных дней не было) — «Другие тарифы» ведёт к списку тарифов с описаниями
+    assert "Другие тарифы" in buttons(kb) and "show_tariffs" in callbacks(kb) and "Сменить тариф" not in buttons(kb)
+    # Платная действующая — «Сменить тариф»
+    sql(path, "UPDATE subscriptions SET bs_paid_until = ? WHERE id = ?",
+        ((now + timedelta(days=20)).strftime("%Y-%m-%d %H:%M:%S"), sid))
+    await handlers.renew_main(FakeCallback(2))
+    assert "Сменить тариф" in buttons(screens[-1][2]) and "Другие тарифы" not in buttons(screens[-1][2])
+    # Платная, но истекла — снова «Другие тарифы»
+    sql(path, "UPDATE subscriptions SET bs_paid_until = ? WHERE telegram_id = 3",
+        ((now - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S"),))
+    await handlers.renew_main(FakeCallback(3))
+    assert "Другие тарифы" in buttons(screens[-1][2]) and "Сменить тариф" not in buttons(screens[-1][2])
     await handlers.renew_select_plan(FakeCallback(2, data=f"renew_type_1_{sid}"))
     assert screens[-1][0] == "renew" and callbacks(screens[-1][2])[-1] == f"view_sub_{sid}"   # из карточки — в карточку
     await handlers.renew_main(FakeCallback(1))
@@ -123,6 +135,20 @@ async def main():
     image, text, kb = screens[-1]
     assert "твой тариф" in text and "Default ✓" in buttons(kb)
 
+    # Смена тарифа: описание нового тарифа на экране подтверждения; длинное — короткое, чтобы влезло в подпись
+    sql(path, "UPDATE tariff_types SET description = 'Для семьи · 5 устройств', full_description = ? WHERE id = 2",
+        ("Один VPN на всю <b>семью</b> &amp; друзей",))
+    await handlers.switch_tariff_confirm(FakeCallback(2, data=f"switch_to_{sid}_2"))
+    image, text, kb = screens[-1]
+    assert image == "tariffs" and "Один VPN на всю <b>семью</b> &amp; друзей" in text, text
+    assert text.index("Один VPN") < text.index("Сейчас:")                     # описание — сразу под заголовком
+    sql(path, "UPDATE tariff_types SET full_description = ? WHERE id = 2", ("Очень длинно. " * 70,))
+    await handlers.switch_tariff_confirm(FakeCallback(2, data=f"switch_to_{sid}_2"))
+    text = screens[-1][1]
+    assert "Очень длинно" not in text and "Для семьи · 5 устройств" in text
+    assert handlers._caption_len(text) <= handlers.CAPTION_LIMIT
+    assert handlers._caption_len("<b>a</b> &amp; b") == 5
+
     # Как подключиться
     await handlers.connection_guide(FakeCallback(2))
     image, text, kb = screens[-1]
@@ -131,7 +157,7 @@ async def main():
     assert [tariffs.plural_devices(n) for n in (1, 3, 5, 10, 21)] == \
         ["1 устройство", "3 устройства", "5 устройств", "10 устройств", "21 устройство"]
     print("OK  меню: нет подписки (триал/тарифы), активна (статус в шапке, Подписка/Продлить), истекла (Продлить первой); "
-          "карточка, Продлить, Тарифы с отметкой, Как подключиться — со своими картинками; «Назад» из «Продлить» — туда, откуда пришли; склонение устройств")
+          "карточка, Продлить («Другие тарифы» у триала и истёкших), смена тарифа с описанием, Тарифы с отметкой, Как подключиться — со своими картинками; «Назад» из «Продлить» — туда, откуда пришли; склонение устройств")
 
 
 if __name__ == "__main__":
