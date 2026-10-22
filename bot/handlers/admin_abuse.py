@@ -44,7 +44,9 @@ async def _menu():
         "Бот раз в час проверяет и присылает всем админам:\n"
         f"• аномальный трафик — от <b>{abuse.day_gb():g} ГБ</b> за сутки или <b>{abuse.week_gb():g} ГБ</b> за 7 дней (все ноды);\n"
         "• одно устройство (HWID) у нескольких Telegram-аккаунтов;\n"
-        f"• один IP у 2–{abuse.ip_group_max()} аккаунтов, из которых хотя бы двое не платили.\n"
+        f"• один IP у 2–{abuse.ip_group_max()} аккаунтов, из которых хотя бы двое не платили;\n"
+        f"• подпиской пользуются одновременно из ≥ {abuse.session_factor():g} × лимит устройств разных подсетей "
+        f"({abuse.session_hits()} проверки подряд, раз в {abuse.session_interval() // 60} мин).\n"
         "Админы в оповещения не попадают.\n\n"
         f"<b>Игнорируются ({len(ignored)}):</b> "
         + (", ".join(f"<code>{t}</code>" + (f" @{html.escape(infos[t]['username'])}" if infos.get(t, {}).get("username") else "")

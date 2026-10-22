@@ -30,6 +30,7 @@ class SubscriptionReminder:
         self._last_retention_check = float("-inf")
         self._last_abuse_check = float("-inf")
         self._last_referral_check = float("-inf")
+        self._last_session_check = float("-inf")
 
     async def start(self):
         if self.is_running:
@@ -75,6 +76,10 @@ class SubscriptionReminder:
                 await self._check_referrals()
             except Exception as e:
                 logger.error(f"Error in referral rewards check: {e}", exc_info=True)
+            try:
+                await self._check_sessions()
+            except Exception as e:
+                logger.error(f"Error in session IP check: {e}", exc_info=True)
             await asyncio.sleep(self.check_interval)
 
     async def _check_referrals(self):
@@ -87,6 +92,18 @@ class SubscriptionReminder:
             return
         self._last_referral_check = now
         await referrals.process_pending(self.bot, self.panel_api)
+
+    async def _check_sessions(self):
+        """Много одновременных IP при лимите устройств — раз в ABUSE_SESSION_INTERVAL"""
+        from services import abuse
+
+        now = asyncio.get_running_loop().time()
+        if self.panel_api is None or now - self._last_session_check < abuse.session_interval():
+            return
+        self._last_session_check = now
+        result = await abuse.check_sessions(self.bot, self.panel_api)
+        if result:
+            logger.info(f"👥 Оповещения о множестве IP: {result}")
 
     async def _check_abuse(self):
         """Оповещения админам о «плохишах» (трафик, общие устройства/IP) — раз в ABUSE_CHECK_INTERVAL"""

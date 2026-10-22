@@ -340,6 +340,18 @@ async def _m011_referral_rewards(db):
     await db.execute("CREATE INDEX IF NOT EXISTS idx_referral_rewards_status ON referral_rewards(status)")
 
 
+async def _m012_session_flags(db):
+    """Подозрение «много одновременных IP при лимите устройств»: сколько проверок подряд оно держится"""
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS session_flags (
+            panel_user_id INTEGER PRIMARY KEY,
+            hits INTEGER NOT NULL DEFAULT 0,              -- сколько проверок подряд превышен порог
+            last_hit_at TIMESTAMP,
+            max_subnets INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -352,6 +364,7 @@ _MIGRATIONS = [
     (9, _m009_retention),
     (10, _m010_abuse),
     (11, _m011_referral_rewards),
+    (12, _m012_session_flags),
 ]
 
 

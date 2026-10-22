@@ -191,11 +191,74 @@ async def test_referral_links():
           "сводка всех текущих групп ничего не отмечает")
 
 
+class SessionPanel(FakePanel):
+    def __init__(self):
+        super().__init__()
+        self.nodes = [{"uuid": "n1", "name": "Estonia", "address": "203.0.113.10", "isConnected": True},
+                      {"uuid": "n2", "name": "Sweden", "address": "203.0.113.11", "isConnected": True}]
+        self.conns = {"n1": [], "n2": []}
+
+    async def get_nodes(self):
+        return self.nodes
+
+    async def get_node_connections(self, uuid, wait_seconds=30):
+        return self.conns[uuid]
+
+
+def seen(minutes_ago=0):
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+async def test_sessions():
+    path = await fresh_db()
+    panel = SessionPanel()
+    for tid, pid, limit in ((501, 1, 3), (502, 2, 3), (503, 3, 3), (504, 4, 0), (ADMIN, 5, 3)):
+        user(path, tid, username=f"s{tid}")
+        panel.users.append({"id": pid, "username": f"tg{tid}_1", "telegramId": tid, "hwidDeviceLimit": limit})
+    many = [{"ip": f"5.{i}.1.10", "lastSeen": seen()} for i in range(9)]           # 9 разных подсетей
+    panel.conns["n1"] = [
+        {"userId": 1, "ips": many[:5]},
+        {"userId": 2, "ips": [{"ip": f"5.5.5.{i}", "lastSeen": seen()} for i in range(20)]},   # 20 IP, одна /24
+        {"userId": 3, "ips": [{"ip": f"2a00:1:2:3::{i:x}", "lastSeen": seen()} for i in range(20)]},  # одна /64
+        {"userId": 4, "ips": many},                                                 # без лимита устройств
+        {"userId": 5, "ips": many},                                                 # админ
+    ]
+    panel.conns["n2"] = [{"userId": 1, "ips": many[5:] + [{"ip": "203.0.113.12", "lastSeen": seen()},  # 9-я подсеть + мост
+                                                          {"ip": "203.0.113.10", "lastSeen": seen()},  # наша нода
+                                                          {"ip": "9.9.9.9", "lastSeen": seen(30)}]}]   # давно
+    panel.nodes.append({"uuid": "n3", "name": "bridge-node", "address": "203.0.113.12", "isConnected": False})
+    bot = FakeBot()
+
+    assert await abuse.check_sessions(bot, panel) == 0             # 1-я проверка: подозрение, ещё не оповещаем
+    assert await abuse.check_sessions(bot, panel) == 1             # 2-я подряд — оповещение
+    text = bot.sent[-1][1]
+    assert "<code>501</code>" in text and "<b>9</b> разных подсетей" in text and "порог 9" in text
+    assert "203.0.113.12" not in text and "203.0.113.10" not in text and "9.9.9.9" not in text
+    assert "Estonia" in text and "Sweden" in text
+    assert await abuse.check_sessions(bot, panel) == 0             # о том же — не чаще раза в сутки
+    assert all(f"<code>{t}</code>" not in t2 for t in (502, 503, 504, ADMIN) for _, t2, _ in bot.sent)
+
+    # Кратковременный всплеск: было — пропало — снова было => счёт начинается заново
+    panel.users.append({"id": 6, "username": "tg506_1", "telegramId": 506, "hwidDeviceLimit": 2})
+    user(path, 506)
+    spike = {"userId": 6, "ips": [{"ip": f"7.{i}.0.1", "lastSeen": seen()} for i in range(6)]}
+    panel.conns["n1"].append(spike)
+    assert await abuse.check_sessions(bot, panel) == 0
+    panel.conns["n1"].remove(spike)
+    assert await abuse.check_sessions(bot, panel) == 0
+    panel.conns["n1"].append(spike)
+    assert await abuse.check_sessions(bot, panel) == 0             # снова только 1-я проверка подряд
+    assert await abuse.check_sessions(bot, panel) == 1
+    print("OK  сессии: одновременные подсети >= 3 × лимит, 2 проверки подряд; одна /24 и одна /64 — не много; "
+          "наши ноды, старые адреса, без лимита и админы не считаются; всплеск сбрасывается; не чаще раза в сутки")
+
+
 async def main():
     await test_traffic()
     await test_devices()
     await test_lookup()
     await test_referral_links()
+    await test_sessions()
 
 
 if __name__ == "__main__":

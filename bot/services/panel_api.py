@@ -1,3 +1,4 @@
+import asyncio
 import aiohttp
 import logging
 import json
@@ -429,6 +430,27 @@ class PanelAPI:
         )
         if response and not response.get("error") and "response" in response:
             return response["response"].get("topUsers", [])
+        return None
+
+    async def get_node_connections(self, node_uuid: str, wait_seconds: int = 30) -> Optional[List[Dict[str, Any]]]:
+        """
+        Текущие подключения на ноде (обозреватель сессий): [{"userId": id, "ips": [{"ip", "lastSeen"}]}].
+        Панель собирает их фоновой задачей — запрашиваем и ждём результат. None — не удалось.
+        """
+        response = await self._request("POST", f"connections/by-node/{node_uuid}")
+        if not response or response.get("error") or "response" not in response:
+            return None
+        job = response["response"]["jobId"]
+        for _ in range(wait_seconds):
+            result = await self._request("GET", f"connections/by-node/{job}")
+            if not result or result.get("error") or "response" not in result:
+                return None
+            data = result["response"]
+            if data.get("isFailed"):
+                return None
+            if data.get("isCompleted"):
+                return (data.get("result") or {}).get("users", [])
+            await asyncio.sleep(1)
         return None
 
     async def get_all_hwid_devices(self, page_size: int = 1000) -> Optional[List[Dict[str, Any]]]:

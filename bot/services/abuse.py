@@ -11,10 +11,18 @@
      и общий Wi-Fi, их пропускаем.
    Сообщаем о новой группе или когда в группу добавился аккаунт. При первом запуске уже
    существующие группы приходят одной сводкой.
+3. Подпиской пользуются слишком многие (обозреватель сессий панели — только текущие подключения):
+   одновременно подключены из >= ABUSE_SESSION_FACTOR × (лимит устройств) разных подсетей.
+   Защита от ложных срабатываний: считаем подсети /24 (IPv4) и /64 (IPv6), а не адреса (провайдер,
+   смена IPv6); адреса наших нод не считаем; превышение должно держаться ABUSE_SESSION_HITS проверок
+   подряд (раз в ABUSE_SESSION_INTERVAL); пользователи без лимита устройств не проверяются;
+   об одном человеке — не чаще раза в сутки.
 Админы и пользователи из списка «Игнорировать» не попадают в оповещения.
 """
+import asyncio
 import hashlib
 import html
+import ipaddress
 import logging
 import re
 from collections import defaultdict
@@ -43,6 +51,18 @@ def week_gb() -> float:
 
 def ip_group_max() -> int:
     return getattr(config, "ABUSE_IP_GROUP_MAX", 5)
+
+
+def session_factor() -> float:
+    return getattr(config, "ABUSE_SESSION_FACTOR", 3)
+
+
+def session_hits() -> int:
+    return getattr(config, "ABUSE_SESSION_HITS", 2)
+
+
+def session_interval() -> int:
+    return getattr(config, "ABUSE_SESSION_INTERVAL", 600)
 
 
 def telegram_id_of(panel_user: Dict[str, Any]) -> Optional[int]:
@@ -272,6 +292,90 @@ async def check_devices(bot, panel_api) -> Optional[int]:
         await abuse_db.mark_alerted(group["key"])
     await db.set_setting(SETTING_DEVICES_READY, "1")
     return len(new)
+
+
+# ======================================================
+# 3. МНОГО ОДНОВРЕМЕННЫХ IP ПРИ ЛИМИТЕ УСТРОЙСТВ
+# ======================================================
+
+FRESH_SECONDS = 5 * 60   # подключение считается текущим, если адрес был виден за последние 5 минут
+
+
+def subnet_of(ip: str) -> str:
+    """IPv4 — /24, IPv6 — /64: адреса одного провайдера/роутера считаем одним"""
+    address = ipaddress.ip_address(ip)
+    prefix = 24 if address.version == 4 else 64
+    return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
+
+
+async def collect_sessions(panel_api, now: datetime):
+    """
+    Текущие подключения со всех нод: {id пользователя панели: {ip: [названия нод]}}.
+    None — ни одна нода не ответила.
+    """
+    all_nodes = await panel_api.get_nodes() or []
+    own_addresses = {n.get("address") for n in all_nodes}   # трафик между нашими серверами (мосты) не считаем
+    nodes = [n for n in all_nodes if n.get("isConnected") and not n.get("isDisabled")]
+    if not nodes:
+        return None, own_addresses
+    results = await asyncio.gather(*(panel_api.get_node_connections(n["uuid"]) for n in nodes))
+    if all(r is None for r in results):
+        return None, own_addresses
+    sessions: Dict[int, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+    for node, users in zip(nodes, results):
+        for user in users or []:
+            for entry in user.get("ips", []):
+                seen = datetime.fromisoformat(entry["lastSeen"].replace("Z", "+00:00"))
+                if (now - seen).total_seconds() <= FRESH_SECONDS and entry["ip"] not in own_addresses:
+                    sessions[user["userId"]][entry["ip"]].append(node.get("name", "?"))
+    return sessions, own_addresses
+
+
+async def check_sessions(bot, panel_api, now: Optional[datetime] = None) -> Optional[int]:
+    """Возвращает число оповещений (None — панель не ответила)"""
+    now = now or datetime.now(timezone.utc)
+    sessions, _ = await collect_sessions(panel_api, now)
+    if sessions is None:
+        return None
+    panel_users = {u["id"]: u for u in await panel_api.get_all_users() or []}
+    skip = await abuse_db.admin_ids() | await abuse_db.ignored()
+
+    flagged, alerts = set(), []
+    for panel_id, ips in sessions.items():
+        user = panel_users.get(panel_id)
+        limit = int((user or {}).get("hwidDeviceLimit") or 0)
+        tid = telegram_id_of(user) if user else None
+        if not user or limit <= 0 or not tid or tid in skip:
+            continue
+        subnets = {subnet_of(ip) for ip in ips}
+        if len(subnets) < session_factor() * limit:
+            continue
+        flagged.add(panel_id)
+        hits = await abuse_db.session_hit(panel_id, len(subnets), max_gap_minutes=3 * session_interval() // 60)
+        if hits >= session_hits() and not await abuse_db.was_alerted(f"session:{panel_id}", within_days=1):
+            alerts.append((tid, user, limit, ips, subnets, hits))
+
+    # Превышение прошло — счёт «подряд» сбрасываем
+    await abuse_db.session_clear(await abuse_db.session_flagged_ids() - flagged)
+
+    if not alerts:
+        return 0
+    infos = await abuse_db.users_info(a[0] for a in alerts)
+    for tid, user, limit, ips, subnets, hits in alerts:
+        shown = sorted(ips)[:12]
+        ip_lines = "\n".join(f"   <code>{html.escape(ip)}</code> — {html.escape(', '.join(sorted(set(ips[ip]))))}"
+                              for ip in shown)
+        more = f"\n   … и ещё {len(ips) - len(shown)}" if len(ips) > len(shown) else ""
+        text = (
+            f"👥 <b>Подпиской пользуются с множества IP одновременно</b>\n\n"
+            f"{_user_line(tid, infos.get(tid, {}))}\n"
+            f"Подписка: <code>{html.escape(user['username'])}</code> · лимит устройств: <b>{limit}</b>\n\n"
+            f"Сейчас подключены из <b>{len(subnets)}</b> разных подсетей (порог {session_factor() * limit:g} = "
+            f"{session_factor():g} × лимит), держится {hits} проверки подряд:\n{ip_lines}{more}"
+        )
+        await _broadcast(bot, text, _ignore_keyboard([tid]))
+        await abuse_db.mark_alerted(f"session:{user['id']}")
+    return len(alerts)
 
 
 async def run(bot, panel_api) -> Dict[str, Optional[int]]:

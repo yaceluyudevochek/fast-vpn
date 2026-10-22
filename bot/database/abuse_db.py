@@ -77,6 +77,46 @@ async def users_info(telegram_ids) -> Dict[int, Dict[str, Any]]:
             return {row["telegram_id"]: dict(row) for row in await cursor.fetchall()}
 
 
+async def session_hit(panel_user_id: int, subnets: int, max_gap_minutes: int) -> int:
+    """
+    Отметить превышение у пользователя панели. Возвращает число проверок подряд с превышением
+    (если прошлое превышение было давнее max_gap_minutes — счёт начинается заново).
+    """
+    async with _connect() as db:
+        async with db.execute("""
+            SELECT hits FROM session_flags
+            WHERE panel_user_id = ? AND last_hit_at >= datetime('now', ?)
+        """, (panel_user_id, f"-{int(max_gap_minutes)} minutes")) as cursor:
+            row = await cursor.fetchone()
+        hits = (row[0] if row else 0) + 1
+        await db.execute("""
+            INSERT INTO session_flags (panel_user_id, hits, last_hit_at, max_subnets)
+            VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(panel_user_id) DO UPDATE SET
+                hits = excluded.hits, last_hit_at = excluded.last_hit_at,
+                max_subnets = MAX(CASE WHEN excluded.hits = 1 THEN 0 ELSE session_flags.max_subnets END,
+                                  excluded.max_subnets)
+        """, (panel_user_id, hits, subnets))
+        await db.commit()
+        return hits
+
+
+async def session_clear(panel_user_ids):
+    """Превышения больше нет — сбрасываем счёт подряд"""
+    ids = list(panel_user_ids)
+    if not ids:
+        return
+    async with _connect() as db:
+        await db.execute(f"DELETE FROM session_flags WHERE panel_user_id IN ({','.join('?' * len(ids))})", ids)
+        await db.commit()
+
+
+async def session_flagged_ids():
+    async with _connect() as db:
+        async with db.execute("SELECT panel_user_id FROM session_flags") as cursor:
+            return {row[0] for row in await cursor.fetchall()}
+
+
 async def referrals_of(telegram_id: int, limit: int = 10) -> List[int]:
     async with _connect() as db:
         async with db.execute(
