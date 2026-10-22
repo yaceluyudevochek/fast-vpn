@@ -323,6 +323,23 @@ async def _m010_abuse(db):
     """)
 
 
+async def _m011_referral_rewards(db):
+    """Награда за друга — только после того, как друг подключился (появилось устройство в панели)"""
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS referral_rewards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER NOT NULL,
+            friend_id INTEGER NOT NULL UNIQUE,            -- за одного друга награда одна
+            friend_name TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',       -- pending | granted | expired
+            note TEXT,                                    -- например, общее устройство с пригласившим
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            decided_at TIMESTAMP
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_referral_rewards_status ON referral_rewards(status)")
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -334,6 +351,7 @@ _MIGRATIONS = [
     (8, _m008_whitelist_bonus),
     (9, _m009_retention),
     (10, _m010_abuse),
+    (11, _m011_referral_rewards),
 ]
 
 

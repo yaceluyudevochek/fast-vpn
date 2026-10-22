@@ -14,6 +14,8 @@ from database import retention_db
 from services.promo import normalize_code
 from services.subscription_link import reissue_subscription_link
 from services import whitelist
+from services import referrals
+from database import referral_db
 from handlers.payment import router as payment_router
 from handlers.ui_screens import show_screen
 from handlers.ui_emoji import E, BTN, kb_button
@@ -413,75 +415,6 @@ async def select_tariff(callback: CallbackQuery):
 # АКТИВАЦИЯ ТРИАЛА (с созданием подписки для реферера)
 # ==========================================================
 
-REFERRAL_BONUS_DAYS = 7
-
-
-async def reward_referrer(bot, friend, tariff_type: dict, plan: dict):
-    """
-    Друг активировал триал: пригласившему +7 дней к базовой подписке (создаём её, если нет)
-    и бонусные гигабайты белых списков (не сгорают, тратятся сверх обычного лимита).
-    """
-    user_db = await database.get_user(friend.id)
-    if not user_db or not user_db["referred_by"]:
-        return
-    referrer_id = user_db["referred_by"]
-    await database.increment_referral_activated(referrer_id)
-
-    # Базовая подписка реферера (tg{id}_1)
-    referrer_base = next(
-        (s for s in await database.get_user_subscriptions(referrer_id)
-         if s['username_in_panel'] == f"tg{referrer_id}_1"),
-        None
-    )
-    base_id = None
-    if referrer_base:
-        base_id = referrer_base['id']
-        new_expiry = await panel_api.extend_subscription_by_username(
-            referrer_base['username_in_panel'], REFERRAL_BONUS_DAYS
-        )
-        if new_expiry:
-            await database.update_subscription_expiry(base_id, new_expiry)
-    else:
-        logger.info(f"Creating base subscription for referrer {referrer_id} with {REFERRAL_BONUS_DAYS} days")
-        referrer_username = f"tg{referrer_id}_1"
-        new_referrer_user = await panel_api.create_user(
-            username=referrer_username,
-            telegram_id=referrer_id,
-            squad_id=tariff_type['squad_id'],
-            days=REFERRAL_BONUS_DAYS,
-            hwid_limit=tariff_type['hwid_limit'],
-            tag=f"U{referrer_id}_T1"[:16],
-            extra_squad_ids=await whitelist.squads_for_new_user(tariff_type)
-        )
-        if new_referrer_user:
-            # Сохраняем подписку в БД (без отметки trial)
-            base_id = await database.create_subscription(
-                referrer_id, 1, plan['id'],
-                new_referrer_user.get("shortUuid"), new_referrer_user.get("expireAt"),
-                referrer_username, trial=False
-            )
-
-    bonus_line = ""
-    if base_id:
-        try:
-            bonus_gb = await whitelist.grant_referral_bonus(panel_api, base_id)
-            if bonus_gb and await whitelist.is_enabled():
-                bonus_line = f" и <b>+{whitelist.format_gb(int(bonus_gb * whitelist.GB))} ГБ</b> к белым спискам"
-        except Exception as e:
-            logger.error(f"Failed to grant whitelist bonus to referrer {referrer_id}: {e}")
-
-    try:
-        await bot.send_message(
-            referrer_id,
-            f"🎉 <b>У вас новый реферал!</b>\n\n"
-            f"Пользователь {friend.first_name} активировал пробный период.\n"
-            f"{E['sparkle']} Вам начислено <b>+{REFERRAL_BONUS_DAYS} дней</b> подписки{bonus_line}!",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Failed to notify referrer {referrer_id}: {e}")
-
-
 @router.callback_query(F.data == "activate_trial")
 async def activate_trial(callback: CallbackQuery):
     user = callback.from_user
@@ -565,7 +498,7 @@ async def activate_trial(callback: CallbackQuery):
         else:
             await show_screen(callback, "buy", f"{E['cross']} Ошибка при активации пробного периода.")
 
-        await reward_referrer(callback.bot, user, tariff_type, plan)
+        await referrals.queue_reward(callback.bot, user.id, user.first_name)  # награда — после подключения друга
 
     else:
         # Если базовой подписки нет - создаем новую
@@ -603,7 +536,7 @@ async def activate_trial(callback: CallbackQuery):
                 trial=True
             )
 
-            await reward_referrer(callback.bot, user, tariff_type, plan)
+            await referrals.queue_reward(callback.bot, user.id, user.first_name)  # награда — после подключения друга
 
             link = new_user.get("subscriptionUrl")
 
@@ -1030,16 +963,18 @@ async def get_link(callback: CallbackQuery):
         [kb_button("back", "Назад", callback_data="back_to_main")]
     ])
 
-    bonus_text = f"<b>+{REFERRAL_BONUS_DAYS} дней</b> к подписке"
+    bonus_text = f"<b>+{referrals.REFERRAL_BONUS_DAYS} дней</b> к подписке"
     if await whitelist.is_enabled() and whitelist.referral_bonus_gb() > 0:
         bonus_text += f" и <b>+{whitelist.format_gb(int(whitelist.referral_bonus_gb() * whitelist.GB))} ГБ</b> к белым спискам"
+    waiting = await referral_db.pending_count(user.id)
 
     stats_text = (
         f"{E['link']} <b>Твоя реферальная ссылка:</b>\n"
         f"<code>{ref_link}</code>\n\n"
-        f"{E['gift']} <b>Бонус:</b> за каждого друга, активировавшего триал,\n"
+        f"{E['gift']} <b>Бонус:</b> за каждого друга, который активирует триал и подключится к VPN,\n"
         f"ты получаешь {bonus_text}!\n\n"
-        f"{E['people']} Активировали триал: <b>{user_db['referrals_activated']}</b> чел."
+        f"{E['people']} Подключились по твоей ссылке: <b>{user_db['referrals_activated']}</b> чел."
+        + (f"\n{E['clock']} Ждём подключения: <b>{waiting}</b> чел." if waiting else "")
     )
 
     await show_screen(callback, "referral", stats_text, keyboard)
@@ -1065,7 +1000,7 @@ async def ref_command(message: Message):
     text = (
         f"{E['link']} <b>Твоя реферальная ссылка:</b>\n"
         f"<code>{ref_link}</code>\n\n"
-        f"{E['gift']} Активировали триал: <b>{user_db['referrals_activated']}</b> чел."
+        f"{E['gift']} Подключились по твоей ссылке: <b>{user_db['referrals_activated']}</b> чел."
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[

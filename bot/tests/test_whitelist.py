@@ -469,53 +469,6 @@ async def test_bonus_spent_at_rollover():
     print("OK  бонусы списываются только на трафик сверх лимита закрывшейся квоты, один раз; «без лимита» их не тратит")
 
 
-async def test_reward_referrer():
-    from types import SimpleNamespace
-    from handlers import handlers
-
-    class ReferralPanel(FakePanel):
-        async def extend_subscription_by_username(self, username, days, traffic_limit_bytes=None):
-            return FUTURE
-
-        async def create_user(self, username, telegram_id, squad_id, days=30, hwid_limit=3, tag=None,
-                              traffic_limit_bytes=0, extra_squad_ids=None):
-            self.add(username, 500 + len(self.users), squads=[squad_id] + list(extra_squad_ids or []))
-            return {"shortUuid": f"su-{username}", "expireAt": FUTURE, "subscriptionUrl": "https://sub/x"}
-
-    path = await fresh_db()
-    panel = ReferralPanel()
-    handlers.panel_api = panel
-    tariff_type = await db.get_tariff_type(1)
-    plan = (await db.get_tariff_plans(1))[0]
-
-    # У пригласившего есть базовая подписка: +7 дней и +7 ГБ к ней
-    sql(path, "INSERT INTO users (telegram_id, referrals_activated) VALUES (10, 0)")
-    base = await make_sub(path, 10, "tg10_1")
-    panel.add("tg10_1", 110)
-    sql(path, "INSERT INTO users (telegram_id, referred_by) VALUES (20, 10)")
-    bot = FakeBot()
-    await handlers.reward_referrer(bot, SimpleNamespace(id=20, first_name="Друг"), tariff_type, plan)
-    assert (await sub(base))["bs_bonus_bytes"] == 7 * GB
-    assert sql(path, "SELECT referrals_activated FROM users WHERE telegram_id = 10")[0][0] == 1
-    assert bot.sent[0][0] == 10 and "+7 дней" in bot.sent[0][1] and "+7 ГБ</b> к белым спискам" in bot.sent[0][1]
-
-    # Базовой подписки нет: создаётся (со сквадом БС) и сразу получает бонус
-    sql(path, "INSERT INTO users (telegram_id) VALUES (30)")
-    sql(path, "INSERT INTO users (telegram_id, referred_by) VALUES (40, 30)")
-    await handlers.reward_referrer(bot, SimpleNamespace(id=40, first_name="Друг"), tariff_type, plan)
-    created = (await db.get_user_subscriptions(30))[0]
-    assert created["username_in_panel"] == "tg30_1" and created["bs_bonus_bytes"] == 7 * GB
-    assert BS in panel.squads("tg30_1")
-
-    # БС выключены: бонус всё равно копится, но в сообщении о нём не говорим
-    await whitelist.set_enabled(False)
-    sql(path, "INSERT INTO users (telegram_id, referred_by) VALUES (50, 10)")
-    await handlers.reward_referrer(bot, SimpleNamespace(id=50, first_name="Друг"), tariff_type, plan)
-    assert (await sub(base))["bs_bonus_bytes"] == 14 * GB
-    assert "белым спискам" not in bot.sent[-1][1] and "+7 дней" in bot.sent[-1][1]
-    print("OK  награда за друга: +7 дней и +7 ГБ к базовой подписке (создаётся, если нет); при выключенных БС копится молча")
-
-
 async def test_status_text():
     path = await fresh_db()
     panel = FakePanel()
@@ -590,7 +543,6 @@ async def main():
     await test_warning()
     await test_referral_bonus()
     await test_bonus_spent_at_rollover()
-    await test_reward_referrer()
     await test_status_text()
     await test_migration()
 
