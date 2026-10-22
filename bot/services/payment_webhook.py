@@ -506,7 +506,7 @@ async def notify_user_success(telegram_id: int, plan: dict, expiry: str,
                     f"📊 Лимит трафика: {traffic_text}\n"
                     f"📅 Новая дата: {formatted_date}\n\n"
                     f"💡 <i>Ссылка для подключения осталась прежней.\n"
-                    f"Если нужно скопировать её заново, зайдите в 'Мои подписки'</i>"
+                    f"Если нужно скопировать её заново, откройте «Подписка» в боте</i>"
                 )
             else:
                 if reset_traffic:
@@ -540,7 +540,7 @@ async def notify_user_success(telegram_id: int, plan: dict, expiry: str,
                 f"📦 Тариф: {plan['tariff_name']}\n"
                 f"📅 Срок: {plan['days']} дней\n"
                 f"📊 Лимит трафика: {traffic_text}\n\n"
-                f"🔗 Ссылка для подключения будет доступна в разделе 'Мои подписки'\n\n"
+                f"🔗 Ссылка для подключения будет доступна в разделе «Подписка»\n\n"
                 f"💡 <i>Если ссылка не открывается автоматически:\n"
                 f"• Скопируйте её\n"
                 f"• Откройте Hiddify, v2Ray или другой клиент\n"
@@ -548,7 +548,7 @@ async def notify_user_success(telegram_id: int, plan: dict, expiry: str,
             )
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📱 Мои подписки", callback_data="my_subscriptions")],
+            [InlineKeyboardButton(text="🔒 Подписка", callback_data="my_subscriptions")],
             [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_main")]
         ])
 

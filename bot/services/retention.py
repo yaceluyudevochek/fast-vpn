@@ -94,12 +94,12 @@ def _keyboard(kind: str) -> InlineKeyboardMarkup:
 
     support = getattr(config, "SUPPORT_URL", None)
     rows = {
-        "winback": [[kb_button("subs", "Мои подписки", callback_data="my_subscriptions")],
-                    [kb_button("buy", "Продлить подписку", callback_data="show_tariffs")]],
+        "winback": [[kb_button("subs", "Подписка", callback_data="my_subscriptions")],
+                    [kb_button("buy", "Продлить подписку", callback_data="renew")]],
         "trial_promo": [[kb_button("buy", "Выбрать подписку", callback_data="show_tariffs")]],
-        "trial_gift": [[kb_button("subs", "Мои подписки", callback_data="my_subscriptions")],
+        "trial_gift": [[kb_button("subs", "Подписка", callback_data="my_subscriptions")],
                        [kb_button("buy", "Оформить подписку", callback_data="show_tariffs")]],
-        "trial_idle": [[kb_button("subs", "Мои подписки", callback_data="my_subscriptions")]]
+        "trial_idle": [[kb_button("subs", "Подписка", callback_data="my_subscriptions")]]
                       + ([[kb_button("chat", "Поддержка", url=support)]] if support else []),
         "start_only": [[kb_button("trial", "Попробовать бесплатно", callback_data="activate_trial")],
                        [kb_button("info", "Подробнее", callback_data="info_menu")]],

@@ -191,13 +191,13 @@ class SubscriptionReminder:
         text = (
             f"{E['info']} <b>Пробный период идёт, а подключения пока нет</b>\n\n"
             "Подключиться можно за минуту:\n\n"
-            "<b>1.</b> Открой «Мои подписки» и скопируй ссылку\n"
+            "<b>1.</b> Открой «Подписка» в боте и скопируй ссылку\n"
             "<b>2.</b> Установи приложение <b>Happ</b> (iOS, Android, ПК)\n"
             "<b>3.</b> Вставь ссылку в приложение и нажми «Подключиться»\n\n"
             "Если что-то не получается — напиши в поддержку, поможем."
         )
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [kb_button("subs", "Мои подписки", callback_data="my_subscriptions")],
+            [kb_button("subs", "Подписка", callback_data="my_subscriptions")],
             [kb_button("chat", "Поддержка", url=SUPPORT_URL)],
         ])
         try:
@@ -371,7 +371,7 @@ class SubscriptionReminder:
                 f"Подписка <b>{tariff_name}</b> истекает <b>через 1 день</b>.\n"
                 f"📅 Дата окончания: {formatted_date}\n\n"
                 "Чтобы продолжить пользоваться VPN, пожалуйста, продлите подписку.\n\n"
-                "💎 Нажмите /start и выберите 'Мои подписки' для продления."
+                "💎 Нажмите /start и выберите «Продлить»."
             )
 
             await self.bot.send_message(telegram_id, text, parse_mode="HTML")
@@ -425,7 +425,7 @@ class SubscriptionReminder:
                 f"{E['cross']} <b>Подписка истекла</b>\n\n"
                 f"Срок действия подписки <b>{tariff_name}</b> истек {formatted_date}.\n\n"
                 f"{E['diamond']} Для восстановления доступа к VPN, пожалуйста, продлите подписку.\n\n"
-                "👉 Нажмите /start и выберите 'Мои подписки'"
+                "👉 Нажмите /start и выберите «Продлить»"
             )
 
             await self.bot.send_message(telegram_id, text, parse_mode="HTML")

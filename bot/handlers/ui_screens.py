@@ -36,6 +36,9 @@ IMAGES = {
     "tariffs": "tariffs.png",
     "payment": "payment.png",
     "subs": "subscriptions.png",
+    "renew": "renew.png",
+    "trial": "trial.png",
+    "guide": "guide.png",
     "info": "info.png",
     "referral": "referral.png",
 }

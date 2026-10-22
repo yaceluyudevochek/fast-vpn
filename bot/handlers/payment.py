@@ -280,7 +280,7 @@ async def check_payment(callback: CallbackQuery):
         plan = await db.get_tariff_plan(transaction['plan_id'])
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [kb_button("subs", "Мои подписки", callback_data="my_subscriptions")],
+            [kb_button("subs", "Подписка", callback_data="my_subscriptions")],
             [kb_button("home", "В меню", callback_data="back_to_main")]
         ])
 
@@ -289,7 +289,7 @@ async def check_payment(callback: CallbackQuery):
             "payment",
             f"{E['check']} <b>Платёж подтверждён!</b>\n\n"
             f"Твоя подписка успешно активирована.\n"
-            f"Перейди в раздел «Мои подписки», чтобы получить ссылку.",
+            f"Открой «Подписка», чтобы получить ссылку.",
             keyboard
         )
 

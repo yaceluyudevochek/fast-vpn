@@ -650,6 +650,19 @@ async def get_subscription_by_short_uuid(short_uuid: str) -> Optional[Dict[str, 
             return dict(row) if row else None
 
 
+async def user_had_trial(telegram_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        for table in ("subscriptions", "subscriptions_archive"):
+            try:
+                async with db.execute(f"SELECT 1 FROM {table} WHERE telegram_id = ? AND trial_used = 1 LIMIT 1",
+                                      (telegram_id,)) as cursor:
+                    if await cursor.fetchone():
+                        return True
+            except aiosqlite.OperationalError:
+                pass  # архива ещё нет (до миграции #13)
+    return False
+
+
 async def get_user_main_subscription(telegram_id: int) -> Optional[Dict[str, Any]]:
     """Подписка пользователя (одна на аккаунт; если по старым данным их больше — самая поздняя по сроку)"""
     async with aiosqlite.connect(DB_PATH) as db:

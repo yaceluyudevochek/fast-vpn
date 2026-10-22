@@ -3,6 +3,7 @@ from aiogram.filters import Command
 from aiogram.filters import CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+import html
 import logging
 from datetime import datetime, timedelta
 
@@ -31,42 +32,72 @@ panel_api = PanelAPI(PANEL_API_URL, PANEL_API_KEY)
 # ГЛАВНОЕ МЕНЮ
 # ==========================================================
 
-async def render_main_menu(target, user_id: int, first_name: str):
-    user_db = await database.get_user(user_id)
+def _expiry_of(subscription: dict):
+    value = subscription.get('subscription_expiry')
+    return datetime.fromisoformat(value.replace('Z', '+00:00')) if value else None
 
+
+def _left_text(expiry) -> str:
+    left = expiry - datetime.now(expiry.tzinfo)
+    return "меньше дня" if left < timedelta(days=1) else tariffs.plural_days(left.days)
+
+
+async def _bs_short_line(subscription: dict) -> str:
+    """Одна строка про белые списки для шапки меню (пусто — БС выключены или не положены)"""
+    try:
+        status = await whitelist.get_status(panel_api, subscription)
+    except Exception as e:
+        logger.error(f"Whitelist status failed for menu: {e}")
+        return ""
+    if not status:
+        return ""
+    if status.state == "admin_off":
+        return f"{E['shield']} Белые списки: отключены\n"
+    if status.state == "admin_on":
+        return f"{E['shield']} Белые списки: без лимита\n"
+    if status.state == "exhausted" or (status.used is not None and status.used >= status.quota.total):
+        return f"{E['shield']} Белые списки: лимит исчерпан\n"
+    if status.used is None:
+        return ""
+    return (f"{E['shield']} Белые списки: осталось <b>{whitelist.format_gb(status.remaining)} из "
+            f"{whitelist.format_gb(status.quota.total)} ГБ</b>\n")
+
+
+async def render_main_menu(target, user_id: int, first_name: str):
+    """Главное меню: нет подписки / подписка активна / подписка истекла"""
+    user_db = await database.get_user(user_id)
     if user_db and user_db["role"] == "banned":
-        await show_screen(
-            target,
-            "start",
-            f"{E['cross']} Ты заблокирован и не можешь пользоваться ботом."
-        )
+        await show_screen(target, "start", f"{E['cross']} Ты заблокирован и не можешь пользоваться ботом.")
         return
 
-    subscriptions = await database.get_user_subscriptions(user_id)
-    active_subs = [s for s in subscriptions if s["status"] == "ACTIVE"]
+    hello = f"{E['wave']} <b>Привет, {html.escape(first_name or '')}!</b>\n\n"
+    footer = [kb_button("referral", "Пригласить друга", callback_data="get_link"),
+              kb_button("info", "Информация", callback_data="info_menu")]
+    subscription = await database.get_user_main_subscription(user_id)
+    expiry = _expiry_of(subscription) if subscription else None
 
-    if active_subs:
-        status_line = f"{E['shield']} У тебя <b>{len(active_subs)}</b> активных подписок."
+    if not subscription:
+        trial = not await database.user_had_trial(user_id)
+        text = hello + ("Попробуй VPN бесплатно — <b>3 дня</b> без оплаты." if trial
+                        else "Оформи подписку — выбери тариф ниже.")
+        rows = []
+        if trial:
+            rows.append([kb_button("trial", "Попробовать бесплатно", callback_data="activate_trial", style="primary")])
+        rows.append([kb_button("buy", "Тарифы", callback_data="show_tariffs", **({} if trial else {"style": "primary"}))])
+    elif expiry and expiry > datetime.now(expiry.tzinfo):
+        text = (hello +
+                f"{E['shield']} <b>{subscription['tariff_name']}</b> · {subscription['tariff_hwid_limit']} устройств · "
+                f"до <b>{(expiry + timedelta(hours=3)):%d.%m.%Y}</b> ({_left_text(expiry)})\n"
+                + await _bs_short_line(subscription))
+        rows = [[kb_button("subs", "Подписка", callback_data="my_subscriptions", style="success")],
+                [kb_button("buy", "Продлить", callback_data="renew", style="primary")]]
     else:
-        status_line = f"{E['drop']} Пока нет активных подписок — активируй бесплатный триал или оформи подписку."
-
-    text = (
-        f"{E['wave']} <b>Привет, {first_name}!</b>\n\n"
-        f"{status_line}\n\n"
-        f"Выбери действие ниже"
-    )
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [kb_button("buy", "Купить/продлить", callback_data="show_tariffs", style="primary")],
-        [kb_button("subs", "Мои подписки", callback_data="my_subscriptions", style="success")],
-        [
-            kb_button("referral", "Пригласить друга", callback_data="get_link"),
-            kb_button("trial", "Триал", callback_data="activate_trial")
-        ],
-        [kb_button("info", "Информация", callback_data="info_menu")]
-    ])
-
-    await show_screen(target, "start", text, keyboard)
+        ended = f" {(expiry + timedelta(hours=3)):%d.%m.%Y}" if expiry else ""
+        text = hello + f"{E['cross']} Подписка <b>{subscription['tariff_name']}</b> закончилась{ended}\n"
+        rows = [[kb_button("buy", "Продлить", callback_data="renew", style="primary")],
+                [kb_button("subs", "Подписка", callback_data="my_subscriptions")]]
+    rows.append(footer)
+    await show_screen(target, "start", text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 # ==========================================================
@@ -141,24 +172,37 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
 @router.callback_query(F.data == "show_tariffs")
 async def show_tariff_types(callback: CallbackQuery):
     tariff_types = await database.get_all_tariff_types()
-
     if not tariff_types:
         await callback.answer("❌ Тарифы временно недоступны", show_alert=True)
         return
 
-    keyboard = []
+    subscription = await database.get_user_main_subscription(callback.from_user.id)
+    current = subscription['tariff_type_id'] if subscription else None
+    bs_on = await whitelist.is_enabled()
+    lines, keyboard = [], []
     for tt in tariff_types:
-        button_text = f"{tt['name']} — {tt['description'] or 'Лимит: ' + str(tt['hwid_limit']) + ' устройств'}"
-        keyboard.append([kb_button("tag", button_text, callback_data=f"select_type_{tt['id']}")])
-
+        plans = await database.get_tariff_plans(tt['id'])
+        if not plans:
+            continue
+        min_price = min(p['price'] for p in plans)
+        mark = " ✓ твой тариф" if tt['id'] == current else ""
+        details = f"{tt['hwid_limit']} устройств"
+        if bs_on and tt.get('bs_limit_gb'):
+            details += f", белые списки {tt['bs_limit_gb']} ГБ"
+        line = f"• <b>{tt['name']}</b>{mark} — {details}, от {min_price} ₽"
+        if subscription and tt['id'] != current:
+            pv = await tariffs.preview(subscription, tt['id'])
+            if pv and pv.remaining_old.total_seconds() > 0:
+                line += f"\n   остаток: {tariffs.days_text(pv.remaining_old)} → {tariffs.days_text(pv.remaining_new)}"
+        lines.append(line)
+        keyboard.append([kb_button("tag", f"{tt['name']}{' ✓' if tt['id'] == current else ''}",
+                                   callback_data=f"select_type_{tt['id']}")])
     keyboard.append([kb_button("back", "Назад", callback_data="back_to_main")])
 
-    text = (
-        f"{E['tag']} <b>Выбери тип подписки</b>\n\n"
-        f"Каждый тип имеет свои тарифные планы"
-    )
-
-    await show_screen(callback, "buy", text, InlineKeyboardMarkup(inline_keyboard=keyboard))
+    text = f"{E['tag']} <b>Тарифы</b>\n\n" + "\n".join(lines)
+    if subscription:
+        text += "\n\nПри переходе на другой тариф оставшиеся дни не сгорают — они пересчитываются по цене тарифа"
+    await show_screen(callback, "tariffs", text, InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
 
 
@@ -265,27 +309,36 @@ async def render_select_plan(target, user_id: int, plan_id: int, state: FSMConte
     return None
 
 
+@router.callback_query(F.data == "renew")
+async def renew_main(callback: CallbackQuery):
+    """«Продлить» из главного меню: планы текущего тарифа (подписки нет — список тарифов)"""
+    subscription = await database.get_user_main_subscription(callback.from_user.id)
+    if not subscription:
+        await show_tariff_types(callback)
+        return
+    await _render_renew(callback, subscription)
+
+
 @router.callback_query(F.data.startswith("renew_type_"))
 async def renew_select_plan(callback: CallbackQuery):
     """Показать доступные планы для продления конкретной подписки"""
     try:
         # Формат: renew_type_{tariff_type_id}_{subscription_id}
-        parts = callback.data.split("_")
-        tariff_type_id = int(parts[2])
-        subscription_id = int(parts[3])
+        subscription_id = int(callback.data.split("_")[3])
     except (IndexError, ValueError):
         await callback.answer("❌ Ошибка в данных", show_alert=True)
         return
+    subscription = await _own_subscription(callback, subscription_id)
+    if subscription:
+        await _render_renew(callback, subscription)
 
-    # Получаем информацию о типе тарифа
+
+async def _render_renew(callback: CallbackQuery, subscription: dict):
+    subscription_id = subscription['id']
+    tariff_type_id = subscription['tariff_type_id']
     tariff_type = await database.get_tariff_type(tariff_type_id)
     if not tariff_type:
         await callback.answer("❌ Тип тарифа не найден", show_alert=True)
-        return
-
-    # Получаем подписку для отображения текущего статуса (только свою)
-    subscription = await _own_subscription(callback, subscription_id)
-    if not subscription:
         return
 
     # Получаем актуальную информацию из API для форматирования даты
@@ -327,8 +380,9 @@ async def renew_select_plan(callback: CallbackQuery):
 
         keyboard.append([kb_button("calendar", button_text, callback_data=f"renew_plan_{plan['id']}_{subscription_id}")])
 
-    # Кнопка возврата к подписке
-    keyboard.append([kb_button("back", "Назад к подписке", callback_data=f"view_sub_{subscription_id}")])
+    if len(await database.get_all_tariff_types()) > 1:
+        keyboard.append([kb_button("reset", "Сменить тариф", callback_data=f"switch_tariff_{subscription_id}")])
+    keyboard.append([kb_button("back", "Назад", callback_data="back_to_main")])
 
     # Определяем статус для отображения
     status_emoji = E['check'] if info and info['is_active'] else E['cross']
@@ -354,7 +408,7 @@ async def renew_select_plan(callback: CallbackQuery):
         f"\nВыбери срок продления:"
     )
 
-    await show_screen(callback, "tariffs", text, InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await show_screen(callback, "renew", text, InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
 
 
@@ -442,7 +496,7 @@ async def activate_trial(callback: CallbackQuery):
 
     plan = plans[0]
 
-    await show_screen(callback, "buy", f"{E['clock']} Активирую пробный период...")
+    await show_screen(callback, "trial", f"{E['clock']} Активирую пробный период...")
 
     # Одна подписка на аккаунт: если подписка уже есть — триал добавляет к ней 3 дня Standart,
     # пересчитанные по коэффициенту в её тариф
@@ -475,7 +529,7 @@ async def activate_trial(callback: CallbackQuery):
             link = (user_data or {}).get("subscriptionUrl")
 
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [kb_button("subs", "Мои подписки", callback_data="my_subscriptions")],
+                [kb_button("subs", "Подписка", callback_data="my_subscriptions")],
                 [kb_button("home", "В меню", callback_data="back_to_main")]
             ])
 
@@ -487,9 +541,9 @@ async def activate_trial(callback: CallbackQuery):
                 f"{link}"
             )
 
-            await show_screen(callback, "buy", text, keyboard)
+            await show_screen(callback, "trial", text, keyboard)
         else:
-            await show_screen(callback, "buy", f"{E['cross']} Ошибка при активации пробного периода.")
+            await show_screen(callback, "trial", f"{E['cross']} Ошибка при активации пробного периода.")
 
         await referrals.queue_reward(callback.bot, user.id, user.first_name)  # награда — после подключения друга
 
@@ -534,7 +588,7 @@ async def activate_trial(callback: CallbackQuery):
             link = new_user.get("subscriptionUrl")
 
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [kb_button("subs", "Мои подписки", callback_data="my_subscriptions")],
+                [kb_button("subs", "Подписка", callback_data="my_subscriptions")],
                 [kb_button("home", "В меню", callback_data="back_to_main")]
             ])
 
@@ -545,9 +599,9 @@ async def activate_trial(callback: CallbackQuery):
                 f"{link}"
             )
 
-            await show_screen(callback, "buy", text, keyboard)
+            await show_screen(callback, "trial", text, keyboard)
         else:
-            await show_screen(callback, "buy", f"{E['cross']} Ошибка при активации пробного периода.")
+            await show_screen(callback, "trial", f"{E['cross']} Ошибка при активации пробного периода.")
 
 
 # ==========================================================
@@ -561,13 +615,13 @@ async def my_subscriptions(callback: CallbackQuery):
     subscriptions = await database.get_user_subscriptions(user_id)
 
     if not subscriptions:
-        text = (
-            f"{E['drop']} У тебя пока нет подписок.\n\n"
-            f"Активируй триал или оформи подписку"
-        )
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [kb_button("back", "Назад", callback_data="back_to_main")]
-        ])
+        trial = not await database.user_had_trial(user_id)
+        text = f"{E['drop']} У тебя пока нет подписки.\n\n" + (
+            "Попробуй бесплатно 3 дня или выбери тариф" if trial else "Выбери тариф, чтобы подключиться")
+        rows = [[kb_button("trial", "Попробовать бесплатно", callback_data="activate_trial")]] if trial else []
+        rows += [[kb_button("buy", "Тарифы", callback_data="show_tariffs")],
+                 [kb_button("home", "В меню", callback_data="back_to_main")]]
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
         await show_screen(callback, "subs", text, keyboard)
         await callback.answer()
         return
@@ -634,7 +688,7 @@ async def _render_subscription(callback: CallbackQuery, subscription: dict):
         'traffic_limit_bytes'] == 0 else f"{plan['traffic_limit_bytes'] / (1024 ** 3):.0f} GB" if plan else "неизвестно"
 
     text_parts = [
-        f"{E['diamond']} <b>Подписка: {subscription['tariff_name']}</b>\n\n",
+        f"{E['diamond']} <b>Тариф {subscription['tariff_name']}</b>\n\n",
         f"{status_text}\n",
         f"{E['shield']} Устройств: <b>{devices_count} / {subscription['tariff_hwid_limit']}</b>\n",
         f"{E['chart']} Лимит трафика: <b>{traffic_text}</b>\n"
@@ -654,25 +708,19 @@ async def _render_subscription(callback: CallbackQuery, subscription: dict):
     if link:
         text += (
             f"\n{E['link']} <b>Ссылка для подключения:</b>\n"
-            f"{link}\n\n"
-            f"{E['bulb']} <i>Не открылась автоматически? Скопируй ссылку и вставь "
-            "вручную в приложение Happ, v2Ray или v2Box.</i>"
+            f"<code>{link}</code>\n\n"
+            f"{E['bulb']} <i>Нажми на ссылку, чтобы скопировать, и вставь её в приложение Happ. "
+            "Подробнее — «Как подключиться».</i>"
         )
 
-    keyboard = []
-
-    if info and info['is_active']:
-        keyboard.append([kb_button("reset", "Сбросить лимит устройств", callback_data=f"reset_devices_{subscription_id}")])
-        keyboard.append([kb_button("link", "Перевыпустить ссылку", callback_data=f"revoke_link_{subscription_id}")])
-
+    renew_row = [kb_button("buy", "Продлить", callback_data=f"renew_type_{subscription['tariff_type_id']}_{subscription_id}")]
     if len(await database.get_all_tariff_types()) > 1:
-        keyboard.append([kb_button("reset", "Сменить тариф", callback_data=f"switch_tariff_{subscription_id}")])
-
-    keyboard.append([kb_button(
-        "buy", "Продлить подписку",
-        callback_data=f"renew_type_{subscription['tariff_type_id']}_{subscription_id}"
-    )])
-
+        renew_row.append(kb_button("reset", "Сменить тариф", callback_data=f"switch_tariff_{subscription_id}"))
+    keyboard = [renew_row]
+    if info and info['is_active']:
+        keyboard.append([kb_button("reset", "Сбросить устройства", callback_data=f"reset_devices_{subscription_id}"),
+                         kb_button("link", "Перевыпустить ссылку", callback_data=f"revoke_link_{subscription_id}")])
+    keyboard.append([kb_button("info", "Как подключиться", callback_data="guide")])
     keyboard.append([kb_button("home", "В меню", callback_data="back_to_main")])
 
     await show_screen(callback, "subs", text, InlineKeyboardMarkup(inline_keyboard=keyboard))
@@ -767,6 +815,31 @@ async def render_renew_plan(target, user_id: int, plan_id: int, subscription_id:
 
     await show_screen(target, "payment", text, keyboard)
     return None
+
+
+# ==========================================================
+# КАК ПОДКЛЮЧИТЬСЯ
+# ==========================================================
+
+@router.callback_query(F.data == "guide")
+async def connection_guide(callback: CallbackQuery):
+    subscription = await database.get_user_main_subscription(callback.from_user.id)
+    text = (
+        f"{E['info']} <b>Как подключиться</b>\n\n"
+        "<b>1.</b> Установи приложение <b>Happ</b> — оно есть в App Store, Google Play, для Windows и macOS.\n"
+        "<b>2.</b> Открой «Подписка» в боте и нажми на ссылку — она скопируется.\n"
+        "<b>3.</b> В Happ нажми «+» и выбери «Вставить из буфера обмена» — появятся серверы.\n"
+        "<b>4.</b> Выбери сервер и нажми большую кнопку подключения.\n\n"
+        f"{E['bulb']} Серверы не появились или не подключается — обнови подписку в Happ (потяни список вниз). "
+        "Не помогло — напиши в поддержку, поможем."
+    )
+    rows = []
+    if subscription:
+        rows.append([kb_button("subs", "Подписка", callback_data=f"view_sub_{subscription['id']}")])
+    rows.append([kb_button("chat", "Поддержка", url=SUPPORT_URL)])
+    rows.append([kb_button("home", "В меню", callback_data="back_to_main")])
+    await show_screen(callback, "guide", text, InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
 
 
 # ==========================================================
