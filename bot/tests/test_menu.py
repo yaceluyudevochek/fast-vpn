@@ -88,7 +88,7 @@ async def main():
     sid = await db.create_subscription(2, 1, 1, "s2", iso(now + timedelta(days=21, hours=2)), "tg2_1")
     await handlers.render_main_menu(None, 2, "Вася")
     image, text, kb = screens[-1]
-    assert "Default" in text and "3 устройств" in text and "21 день" in text, text
+    assert "Default" in text and "3 устройства" in text and "21 день" in text, text
     assert buttons(kb)[:2] == ["Подписка", "Продлить"] and callbacks(kb)[1] == "renew"
 
     # 3. Истекла: Продлить — первой
@@ -112,6 +112,9 @@ async def main():
     await handlers.renew_main(FakeCallback(2))
     image, text, kb = screens[-1]
     assert image == "renew" and any(c.startswith("renew_plan_") for c in callbacks(kb)) and "Сменить тариф" in buttons(kb)
+    assert callbacks(kb)[-1] == "back_to_main"                                   # из меню — назад в меню
+    await handlers.renew_select_plan(FakeCallback(2, data=f"renew_type_1_{sid}"))
+    assert screens[-1][0] == "renew" and callbacks(screens[-1][2])[-1] == f"view_sub_{sid}"   # из карточки — в карточку
     await handlers.renew_main(FakeCallback(1))
     assert screens[-1][0] == "tariffs"
 
@@ -124,8 +127,11 @@ async def main():
     await handlers.connection_guide(FakeCallback(2))
     image, text, kb = screens[-1]
     assert image == "guide" and "Happ" in text and buttons(kb)[0] == "Подписка"
+    from services import tariffs
+    assert [tariffs.plural_devices(n) for n in (1, 3, 5, 10, 21)] == \
+        ["1 устройство", "3 устройства", "5 устройств", "10 устройств", "21 устройство"]
     print("OK  меню: нет подписки (триал/тарифы), активна (статус в шапке, Подписка/Продлить), истекла (Продлить первой); "
-          "карточка, Продлить, Тарифы с отметкой, Как подключиться — со своими картинками")
+          "карточка, Продлить, Тарифы с отметкой, Как подключиться — со своими картинками; «Назад» из «Продлить» — туда, откуда пришли; склонение устройств")
 
 
 if __name__ == "__main__":

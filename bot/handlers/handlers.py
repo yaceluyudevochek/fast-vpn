@@ -86,7 +86,7 @@ async def render_main_menu(target, user_id: int, first_name: str):
         rows.append([kb_button("buy", "Тарифы", callback_data="show_tariffs", **({} if trial else {"style": "primary"}))])
     elif expiry and expiry > datetime.now(expiry.tzinfo):
         text = (hello +
-                f"{E['shield']} <b>{subscription['tariff_name']}</b> · {subscription['tariff_hwid_limit']} устройств · "
+                f"{E['shield']} <b>{subscription['tariff_name']}</b> · {tariffs.plural_devices(subscription['tariff_hwid_limit'])} · "
                 f"до <b>{(expiry + timedelta(hours=3)):%d.%m.%Y}</b> ({_left_text(expiry)})\n"
                 + await _bs_short_line(subscription))
         rows = [[kb_button("subs", "Подписка", callback_data="my_subscriptions", style="success")],
@@ -186,7 +186,7 @@ async def show_tariff_types(callback: CallbackQuery):
             continue
         min_price = min(p['price'] for p in plans)
         mark = " ✓ твой тариф" if tt['id'] == current else ""
-        details = f"{tt['hwid_limit']} устройств"
+        details = tariffs.plural_devices(tt['hwid_limit'])
         if bs_on and tt.get('bs_limit_gb'):
             details += f", белые списки {tt['bs_limit_gb']} ГБ"
         line = f"• <b>{tt['name']}</b>{mark} — {details}, от {min_price} ₽"
@@ -316,7 +316,7 @@ async def renew_main(callback: CallbackQuery):
     if not subscription:
         await show_tariff_types(callback)
         return
-    await _render_renew(callback, subscription)
+    await _render_renew(callback, subscription, back_to="back_to_main")
 
 
 @router.callback_query(F.data.startswith("renew_type_"))
@@ -330,10 +330,11 @@ async def renew_select_plan(callback: CallbackQuery):
         return
     subscription = await _own_subscription(callback, subscription_id)
     if subscription:
-        await _render_renew(callback, subscription)
+        await _render_renew(callback, subscription, back_to=f"view_sub_{subscription_id}")
 
 
-async def _render_renew(callback: CallbackQuery, subscription: dict):
+async def _render_renew(callback: CallbackQuery, subscription: dict, back_to: str):
+    """Планы продления текущего тарифа; «Назад» — туда, откуда пришли (меню или карточка подписки)"""
     subscription_id = subscription['id']
     tariff_type_id = subscription['tariff_type_id']
     tariff_type = await database.get_tariff_type(tariff_type_id)
@@ -382,7 +383,7 @@ async def _render_renew(callback: CallbackQuery, subscription: dict):
 
     if len(await database.get_all_tariff_types()) > 1:
         keyboard.append([kb_button("reset", "Сменить тариф", callback_data=f"switch_tariff_{subscription_id}")])
-    keyboard.append([kb_button("back", "Назад", callback_data="back_to_main")])
+    keyboard.append([kb_button("back", "Назад", callback_data=back_to)])
 
     # Определяем статус для отображения
     status_emoji = E['check'] if info and info['is_active'] else E['cross']
@@ -859,7 +860,7 @@ async def bs_upgrade_note(subscription: dict, new_type: dict) -> str:
 
 
 async def _tariff_line(tariff_type: dict) -> str:
-    line = f"{tariff_type['hwid_limit']} устройств"
+    line = tariffs.plural_devices(tariff_type['hwid_limit'])
     if tariff_type.get('bs_limit_gb') and await whitelist.is_enabled():
         line += f", белые списки {tariff_type['bs_limit_gb']} ГБ"
     return line

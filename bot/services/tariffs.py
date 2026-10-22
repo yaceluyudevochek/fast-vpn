@@ -57,6 +57,17 @@ def days_text(delta: timedelta) -> str:
     return plural_days(int(days + 1e-6))
 
 
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n = int(n)
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    return few if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else many
+
+
+def plural_devices(n) -> str:
+    return f"{int(n)} {_plural(n, 'устройство', 'устройства', 'устройств')}"
+
+
 def plural_days(n: int) -> str:
     word = "день" if n % 10 == 1 and n % 100 != 11 else ("дня" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "дней")
     return f"{n} {word}"
