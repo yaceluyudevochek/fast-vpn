@@ -51,6 +51,7 @@ async def _menu():
                      for t in ignored) or "никто")
     )
     rows = [[_btn("🔄 Проверить сейчас", "abuse_run")],
+            [_btn("📋 Все текущие совпадения", "abuse_all_groups")],
             [_btn("🔇 Добавить в игнор по Telegram ID", "abuse_ignore_add")]]
     rows += [[_btn(f"✖ Убрать из игнора {t}", f"abuse_unignore_{t}")] for t in ignored[:20]]
     rows.append([_btn("« Назад", "admin_back")])
@@ -124,6 +125,15 @@ async def abuse_run(callback: CallbackQuery):
     )
 
 
+@router.callback_query(F.data == "abuse_all_groups")
+async def abuse_all_groups(callback: CallbackQuery):
+    if not await _require_admin(callback):
+        return
+    await callback.answer("⏳ Собираю...")
+    if await abuse.send_current_groups(callback.bot, panel_api, callback.from_user.id) is None:
+        await callback.message.answer("❌ Панель не ответила, попробуйте позже")
+
+
 # ======================================================
 # TELEGRAM ID ПО USERNAME
 # ======================================================
@@ -170,6 +180,13 @@ async def admin_lookup_input(message: Message, state: FSMContext):
             f"В боте с: {str(user.get('created_at') or '—')[:10]} · роль: {user.get('role') or 'user'}",
             f"Платил: {'да' if info.get('has_paid') else 'нет'} · триал: {'был' if info.get('had_trial') else 'не брал'}",
         ]
+        if info.get("referred_by"):
+            lines.append(f"Пришёл по ссылке: <code>{info['referred_by']}</code>")
+        if info.get("referrals"):
+            invited = await abuse_db.referrals_of(tid)
+            more = f" и ещё {info['referrals'] - len(invited)}" if info["referrals"] > len(invited) else ""
+            lines.append(f"Привёл по своей ссылке: {info['referrals']} — "
+                         + ", ".join(f"<code>{t}</code>" for t in invited) + more)
         for sub in await database.get_user_subscriptions(tid):
             lines.append(f"• {html.escape(sub['tariff_name'])} — до {str(sub['subscription_expiry'] or '—')[:10]} "
                          f"(<code>{html.escape(sub['username_in_panel'] or '')}</code>)")

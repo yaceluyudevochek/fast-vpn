@@ -71,7 +71,8 @@ async def _broadcast(bot, text: str, keyboard: Optional[InlineKeyboardMarkup] = 
             logger.warning(f"Не удалось отправить оповещение админу {admin}: {e}")
 
 
-def _user_line(tid: int, info: Dict[str, Any]) -> str:
+def _user_line(tid: int, info: Dict[str, Any], group_infos: Optional[Dict[int, Dict[str, Any]]] = None) -> str:
+    """Строка об аккаунте; group_infos — все участники группы, чтобы отметить приглашения внутри неё"""
     username = f" (@{html.escape(info['username'])})" if info.get("username") else ""
     if info.get("has_paid"):
         status = "платил"
@@ -80,7 +81,18 @@ def _user_line(tid: int, info: Dict[str, Any]) -> str:
     else:
         status = "не платил"
     since = f", с {str(info['created_at'])[:10]}" if info.get("created_at") else ""
-    return f"• <code>{tid}</code>{username} — {status}{since}"
+    line = f"• <code>{tid}</code>{username} — {status}{since}"
+
+    group_infos = group_infos or {}
+    ref = info.get("referred_by")
+    if ref:
+        inside = " ⚠️ участник этой группы" if ref in group_infos else ""
+        line += f"\n   ↳ пришёл по ссылке <code>{ref}</code>{inside}"
+    if info.get("referrals"):
+        invited_here = sorted(t for t, i in group_infos.items() if t != tid and i.get("referred_by") == tid)
+        here = f", из них в этой группе: {', '.join(f'<code>{t}</code>' for t in invited_here)}" if invited_here else ""
+        line += f"\n   ↳ привёл по своей ссылке: {info['referrals']}{here}"
+    return line
 
 
 # ======================================================
@@ -201,8 +213,39 @@ async def find_device_groups(panel_api) -> Optional[List[Dict[str, Any]]]:
 def _group_text(group: Dict[str, Any]) -> str:
     title = ("📱 <b>Одно устройство у нескольких аккаунтов</b>\nУстройство: " if group["kind"] == "hwid"
              else "🌐 <b>Несколько неплативших аккаунтов с одного IP</b>\nIP: ")
-    lines = [_user_line(t, group["infos"][t]) for t in sorted(group["members"])]
+    lines = [_user_line(t, group["infos"][t], group["infos"]) for t in sorted(group["members"])]
     return f"{title}{group['label']}\n\n" + "\n".join(lines)
+
+
+async def _send_summary(bot, header: str, groups: List[Dict[str, Any]], footer: str = ""):
+    chunk = header
+    for group in groups:
+        part = "\n" + _group_text(group) + "\n"
+        if len(chunk) + len(part) + len(footer) > 3900:
+            await _broadcast(bot, chunk)
+            chunk = ""
+        chunk += part
+    await _broadcast(bot, chunk + footer)
+
+
+async def send_current_groups(bot, panel_api, chat_id: int) -> Optional[int]:
+    """Все текущие совпадения устройств/IP одному админу (ничего не отмечает). None — панель не ответила."""
+    groups = await find_device_groups(panel_api)
+    if groups is None:
+        return None
+    if not groups:
+        await bot.send_message(chat_id, "Совпадений устройств и IP сейчас нет.")
+        return 0
+    header = f"📋 <b>Все текущие совпадения устройств и IP: {len(groups)}</b>\n"
+    chunk = header
+    for group in groups:
+        part = "\n" + _group_text(group) + "\n"
+        if len(chunk) + len(part) > 3900:
+            await bot.send_message(chat_id, chunk, parse_mode="HTML")
+            chunk = ""
+        chunk += part
+    await bot.send_message(chat_id, chunk, parse_mode="HTML")
+    return len(groups)
 
 
 async def check_devices(bot, panel_api) -> Optional[int]:
@@ -220,14 +263,7 @@ async def check_devices(bot, panel_api) -> Optional[int]:
                   "Это все группы, которые уже есть в панели. Дальше будут приходить только новые.\n"
                   if first_run else f"🕵️ <b>Новые совпадения устройств и IP: {len(new)}</b>\n")
         footer = "\nЧтобы не получать оповещения о человеке, добавьте его в игнор: /admin → 🚨 Плохиши."
-        chunk = header
-        for group in new:
-            part = "\n" + _group_text(group) + "\n"
-            if len(chunk) + len(part) + len(footer) > 3900:
-                await _broadcast(bot, chunk)
-                chunk = ""
-            chunk += part
-        await _broadcast(bot, chunk + footer)
+        await _send_summary(bot, header, new, footer)
     else:
         for group in new:
             await _broadcast(bot, _group_text(group), _ignore_keyboard(group["members"]))

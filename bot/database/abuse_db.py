@@ -66,7 +66,8 @@ async def users_info(telegram_ids) -> Dict[int, Dict[str, Any]]:
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(f"""
-            SELECT u.telegram_id, u.username, u.created_at, u.role,
+            SELECT u.telegram_id, u.username, u.created_at, u.role, u.referred_by,
+                   (SELECT COUNT(*) FROM users r WHERE r.referred_by = u.telegram_id) AS referrals,
                    EXISTS (SELECT 1 FROM payment_transactions p
                            WHERE p.telegram_id = u.telegram_id AND p.status = 'CONFIRMED') AS has_paid,
                    EXISTS (SELECT 1 FROM subscriptions s
@@ -74,6 +75,14 @@ async def users_info(telegram_ids) -> Dict[int, Dict[str, Any]]:
             FROM users u WHERE u.telegram_id IN ({marks})
         """, ids) as cursor:
             return {row["telegram_id"]: dict(row) for row in await cursor.fetchall()}
+
+
+async def referrals_of(telegram_id: int, limit: int = 10) -> List[int]:
+    async with _connect() as db:
+        async with db.execute(
+                "SELECT telegram_id FROM users WHERE referred_by = ? ORDER BY created_at DESC LIMIT ?",
+                (telegram_id, limit)) as cursor:
+            return [row[0] for row in await cursor.fetchall()]
 
 
 async def find_users(query: str) -> List[Dict[str, Any]]:

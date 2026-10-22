@@ -162,10 +162,40 @@ async def test_lookup():
     print("OK  поиск: по @username без учёта регистра, по имени из панели tg<ID>_N и по ID; username обновляется при /start")
 
 
+async def test_referral_links():
+    """В оповещении видно, кто кого привёл; приглашение внутри группы помечено"""
+    path = await fresh_db()
+    panel = FakePanel()
+    user(path, 401, username="farmer", trial=True)
+    user(path, 402, username="alt1", trial=True)
+    user(path, 403, username="stranger", trial=True)
+    user(path, 499, username="outsider", paid=True)
+    sql(path, "UPDATE users SET referred_by = 401 WHERE telegram_id = 402")      # 401 привёл 402 (оба в группе)
+    sql(path, "UPDATE users SET referred_by = 499 WHERE telegram_id = 401")      # 401 пришёл от 499 (вне группы)
+    sql(path, "UPDATE users SET referred_by = 401 WHERE telegram_id = 403")      # 401 привёл и 403 (вне группы)
+    for tid, pid in ((401, 1), (402, 2), (403, 3), (499, 9)):
+        panel.add_user(tid, pid)
+    panel.devices = [{"hwid": "X", "userId": 1, "requestIp": "1.1.1.1"},
+                     {"hwid": "X", "userId": 2, "requestIp": "1.1.1.1"}]
+    bot = FakeBot()
+
+    assert await abuse.send_current_groups(bot, panel, ADMIN) == 1
+    text = bot.sent[-1][1]
+    assert "пришёл по ссылке <code>401</code> ⚠️ участник этой группы" in text, text
+    assert "пришёл по ссылке <code>499</code>\n" in text and "499</code> ⚠️" not in text
+    assert "привёл по своей ссылке: 2, из них в этой группе: <code>402</code>" in text
+    assert await abuse_db.was_alerted("hwid:x") is False                        # сводка ничего не отмечает
+    assert await abuse.check_devices(bot, panel) == 1                           # обычная проверка всё равно сообщит
+    assert sorted(await abuse_db.referrals_of(401)) == [402, 403]
+    print("OK  связи: «пришёл по ссылке» (⚠️ если пригласивший в той же группе), «привёл N, из них в группе»; "
+          "сводка всех текущих групп ничего не отмечает")
+
+
 async def main():
     await test_traffic()
     await test_devices()
     await test_lookup()
+    await test_referral_links()
 
 
 if __name__ == "__main__":
