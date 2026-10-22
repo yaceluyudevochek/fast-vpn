@@ -1,6 +1,6 @@
 """
-Награда за приглашённых друзей: +REFERRAL_BONUS_DAYS дней к базовой подписке пригласившего
-и бонусные ГБ белых списков — только после того, как друг подключился к VPN.
+Награда за приглашённых друзей: +REFERRAL_BONUS_DAYS дней к подписке пригласившего
+и ГБ белых списков за эти дни (лимит тарифа / 30 × дни) — только после того, как друг подключился к VPN.
 
 1. Друг активировал триал → награда в ожидании (referral_rewards, status = pending),
    пригласившему сообщаем, что бонус придёт после подключения друга.
@@ -13,7 +13,7 @@
 import html
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from config import config
 from database import abuse_db, referral_db
@@ -33,19 +33,31 @@ def days_label_for(subscription: Optional[Dict[str, Any]], days: int) -> str:
     return f"+{tariffs.plural_days(days)}"
 
 
-async def bonus_label(telegram_id: int) -> str:
-    """Сколько дней за друга получит этот человек — в днях его тарифа (как и будет начислено)"""
+async def reward_for(subscription: Optional[Dict[str, Any]]) -> Tuple[int, int]:
+    """Награда за друга: (дни тарифа подписки, байты белых списков за эти дни). Без подписки — Standart."""
+    days = await tariffs.bonus_days(subscription, REFERRAL_BONUS_DAYS)
+    if subscription:
+        limit = subscription.get("bs_limit_gb")
+    else:
+        limit = (await database.get_tariff_type(tariffs.BASE_TARIFF_ID) or {}).get("bs_limit_gb")
+    return days, whitelist.bytes_for_days(limit, days)
+
+
+async def _gb_text(amount: int, prefix: str = " и ") -> str:
+    if amount <= 0 or not await whitelist.is_enabled():
+        return ""
+    return f"{prefix}<b>+{whitelist.format_gb(amount)} ГБ</b> к белым спискам"
+
+
+async def bonus_text(telegram_id: int) -> str:
+    """«<b>+7 дней</b> к подписке и <b>+7 ГБ</b> к белым спискам» — в днях тарифа человека, как и будет начислено"""
     subscription = await database.get_user_main_subscription(telegram_id)
-    return days_label_for(subscription, await tariffs.bonus_days(subscription, REFERRAL_BONUS_DAYS))
+    days, amount = await reward_for(subscription)
+    return f"<b>{days_label_for(subscription, days)}</b> к подписке" + await _gb_text(amount)
 
 
 def wait_days() -> int:
     return getattr(config, "REFERRAL_WAIT_DAYS", 3)
-
-
-def _bonus_text(prefix: str = " и ") -> str:
-    gb = whitelist.referral_bonus_gb()
-    return f"{prefix}<b>+{whitelist.format_gb(int(gb * whitelist.GB))} ГБ</b> к белым спискам" if gb > 0 else ""
 
 
 async def _send(bot, chat_id: int, text: str):
@@ -66,11 +78,10 @@ async def queue_reward(bot, friend_id: int, friend_name: str):
     referrer_id = user["referred_by"]
     if not await referral_db.queue(referrer_id, friend_id, friend_name):
         return
-    bonus = _bonus_text() if await whitelist.is_enabled() else ""
     await _send(bot, referrer_id, (
         f"🎉 <b>У вас новый реферал!</b>\n\n"
         f"Пользователь {html.escape(friend_name or str(friend_id))} активировал пробный период.\n"
-        f"🎁 Бонус <b>{await bonus_label(referrer_id)}</b>{bonus} начислится, как только он подключится к VPN."
+        f"🎁 Бонус {await bonus_text(referrer_id)} начислится, как только он подключится к VPN."
     ))
 
 
@@ -81,14 +92,15 @@ async def queue_reward(bot, friend_id: int, friend_name: str):
 async def grant(bot, panel_api, referrer_id: int, friend_name: str) -> Optional[int]:
     """
     +7 дней (в днях Standart, пересчитанных по коэффициенту в тариф подписки) к подписке пригласившего
-    (создаём Standart, если подписки нет) и бонусные ГБ белых списков (фиксированные).
+    (создаём Standart, если подписки нет) и ГБ белых списков за эти дни.
     Возвращает id подписки (None — панель не ответила).
     """
     await database.increment_referral_activated(referrer_id)
     base_username = f"tg{referrer_id}_1"
     referrer_sub = await database.get_user_main_subscription(referrer_id)
     base_id = None
-    days_label = days_label_for(None, REFERRAL_BONUS_DAYS)
+    days = REFERRAL_BONUS_DAYS
+    days_label = days_label_for(None, days)
     if referrer_sub:
         base_id = referrer_sub['id']
         days = await tariffs.bonus_days(referrer_sub, REFERRAL_BONUS_DAYS)
@@ -120,8 +132,7 @@ async def grant(bot, panel_api, referrer_id: int, friend_name: str) -> Optional[
     bonus = ""
     if base_id:
         try:
-            if await whitelist.grant_referral_bonus(panel_api, base_id) and await whitelist.is_enabled():
-                bonus = _bonus_text()
+            bonus = await _gb_text(await whitelist.grant_days(panel_api, base_id, days))
         except Exception as e:
             logger.error(f"Failed to grant whitelist bonus to referrer {referrer_id}: {e}")
 
@@ -164,15 +175,14 @@ async def _alert_shared_device(bot, reward: Dict[str, Any], devices: List[Dict[s
     referrer_id, friend_id = reward["referrer_id"], reward["friend_id"]
     infos = await abuse_db.users_info([referrer_id, friend_id])
     labels = ", ".join(sorted({_device_label(d) for d in devices}))
-    bonus = f" и +{whitelist.format_gb(int(whitelist.referral_bonus_gb() * whitelist.GB))} ГБ" \
-        if whitelist.referral_bonus_gb() > 0 else ""
     await _broadcast(bot, (
         f"🧩 <b>Друг подключился с устройства пригласившего</b>\n"
         f"Устройство: {labels}\n\n"
         f"<b>Пригласил:</b>\n{_user_line(referrer_id, infos.get(referrer_id, {}))}\n"
         f"<b>Приглашённый:</b>\n{_user_line(friend_id, infos.get(friend_id, {}))}\n\n"
-        f"Бонус начислен: +{REFERRAL_BONUS_DAYS} дней (в днях Standart) к подписке пригласившего{bonus}. "
-        f"Если это накрутка — заберите дни: /admin → ➖ Уменьшить дни подписки."
+        f"Бонус начислен: +{REFERRAL_BONUS_DAYS} дней (в днях Standart) к подписке пригласившего "
+        f"и ГБ белых списков за эти дни. "
+        f"Если это накрутка — заберите дни (ГБ за них заберутся тоже): /admin → ➖ Уменьшить дни подписки."
     ))
 
 

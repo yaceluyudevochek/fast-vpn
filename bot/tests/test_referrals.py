@@ -39,6 +39,10 @@ class FakePanel:
     async def get_user_by_username(self, username):
         return self.users.get(username)
 
+    async def set_user_squads(self, username, squads):
+        self.users[username]["activeInternalSquads"] = [{"uuid": s} for s in dict.fromkeys(squads)]
+        return True
+
     async def get_user_hwid_devices(self, uid):
         return None if self.down else {"devices": self.devices.get(uid, [])}
 
@@ -64,7 +68,7 @@ async def fresh_db():
     path = os.path.join(tempfile.mkdtemp(), "t.db")
     db.DB_PATH = path
     await db.init_db()
-    sql(path, "UPDATE tariff_types SET bs_limit_gb = 50 WHERE id = 1")
+    sql(path, "UPDATE tariff_types SET bs_limit_gb = 30 WHERE id = 1")   # Standart 30 ГБ: 7 дней за друга = 7 ГБ
     whitelist.config.BS_SQUAD_UUID = BS
     await whitelist.set_enabled(True)
     sql(path, "INSERT INTO users (telegram_id, username, role) VALUES (?, 'boss', 'admin')", (ADMIN,))
@@ -101,12 +105,13 @@ async def test_flow():
     assert (await referrals.process_pending(bot, panel))["granted"] == 0
     panel.down = False
 
-    # Подключился (появилось устройство) — +7 дней и +7 ГБ, счётчик, сообщение
+    # Подключился (появилось устройство) — +7 дней и ГБ за них (7 × 30 / 30 = 7), счётчик, сообщение, сквад БС
     result = await referrals.process_pending(bot, panel)
     assert result == {"granted": 1, "shared_device": 0, "expired": 0}, result
     assert panel.extended == [("tg10_1", 7)] and (await db.get_subscription(base))["bs_bonus_bytes"] == 7 * GB
     assert sql(path, "SELECT referrals_activated FROM users WHERE telegram_id = 10")[0][0] == 1
     assert "подключился к VPN" in bot.sent[-1][1] and "+7 ГБ" in bot.sent[-1][1]
+    assert BS in [s["uuid"] for s in panel.users["tg10_1"]["activeInternalSquads"]]
     assert (await referrals.process_pending(bot, panel))["granted"] == 0     # второй раз не начисляем
     assert sql(path, "SELECT status, note FROM referral_rewards")[0] == ("granted", None)
     print("OK  награда за друга: ждёт подключения, начисляется один раз (+7 дней и +7 ГБ), сбой панели не теряет")

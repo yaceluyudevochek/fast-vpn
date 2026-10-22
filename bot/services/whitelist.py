@@ -6,15 +6,17 @@
 - Трафик считается панелью по всем нодам сквада (серверов БС может быть несколько).
 - Лимит — у типа тарифа (tariff_types.bs_limit_gb, NULL = БС не входит в тариф).
 
-Квота зависит от того, оплачены ли текущие дни подписки (subscriptions.bs_paid_until):
-- оплаченные дни (оплата или дни от админа) — полный лимит тарифа, обновляется
-  каждые 30 дней от начала оплаченного срока (subscriptions.bs_period_anchor);
-  досрочное продление только добавляет дни, лимит обновляется по расписанию;
-- неоплаченные дни (триал, бонусы за рефералов, дни после окончания оплаченного
-  срока) — разовый пул BS_TRIAL_LIMIT_GB на всё время, пополняется только оплатой.
+Единое правило: каждый день подписки даёт лимит тарифа / 30 ГБ (Standart 50 ГБ → 1,67 ГБ в день).
+- Оплаченные дни (subscriptions.bs_paid_until) — полный лимит тарифа на каждые 30 дней от начала
+  оплаченного срока (subscriptions.bs_period_anchor): за 30 дней те же лимит / 30 × 30, но лимит
+  обновляется по периодам, а не выдаётся сразу за весь срок. Досрочное продление только добавляет
+  дни, лимит обновляется по расписанию.
+- Любые другие добавленные дни (триал, админ, бонусы за друзей, подарки) сразу начисляют
+  бонусные ГБ: дни × лимит тарифа / 30 (grant_days). Своей квоты у неоплаченных дней нет —
+  на них работают только бонусные ГБ.
 
-Бонусные ГБ (за друзей, BS_REFERRAL_BONUS_GB; позже — пакеты) — личный запас поверх квоты:
-тратятся, когда обычный лимит квоты израсходован, и не сгорают. Учёт: bs_bonus_bytes —
+Бонусные ГБ — личный запас поверх квоты: тратятся, когда обычный лимит квоты израсходован,
+и не сгорают. Учёт: bs_bonus_bytes —
 начислено, bs_bonus_used — потрачено в закрытых квотах. Когда квота сменяется, трафик сверх
 обычного лимита в закрывшейся квоте списывается из бонусов (bs_quota_* — отслеживаемая квота).
 
@@ -49,12 +51,11 @@ def squad_uuid() -> Optional[str]:
     return getattr(config, "BS_SQUAD_UUID", None) or None
 
 
-def trial_limit_gb() -> float:
-    return getattr(config, "BS_TRIAL_LIMIT_GB", 3)
-
-
-def referral_bonus_gb() -> float:
-    return getattr(config, "BS_REFERRAL_BONUS_GB", 7)
+def bytes_for_days(limit_gb, days: float) -> int:
+    """Сколько байт белых списков дают дни подписки: дни × лимит тарифа / 30"""
+    if not limit_gb or days <= 0:
+        return 0
+    return int(limit_gb * GB * days / PERIOD_DAYS)
 
 
 async def is_enabled() -> bool:
@@ -96,7 +97,7 @@ def _sql_ts(moment: datetime) -> str:
 @dataclass
 class Quota:
     limit: Optional[int]           # обычный лимит квоты, байты; None — БС подписке не положены
-    paid: bool                     # оплаченные дни (полный лимит) или разовый пул
+    paid: bool                     # оплаченные дни (полный лимит) или неоплаченные (лимит 0, только бонусы)
     start: Optional[datetime]      # с какого момента считается трафик
     key: str                       # меняется, когда квота обновляется
     refresh_at: Optional[datetime] = None  # оплаченные дни: когда лимит обновится
@@ -139,10 +140,11 @@ def get_quota(subscription: Dict[str, Any], now: Optional[datetime] = None) -> Q
             upcoming, full = full, int(recorded)
         return Quota(full, True, start, key, refresh_at, paid_until, bonus, upcoming)
 
-    # Неоплаченные дни: разовый пул с конца оплаченного срока (или с начала триала)
+    # Неоплаченные дни: своего лимита нет, тратятся бонусные ГБ (начислены за эти дни).
+    # Трафик считается с конца оплаченного срока (или с начала подписки)
     start = paid_until or _parse_utc(subscription.get("bs_period_anchor")) \
         or _parse_utc(subscription.get("created_at")) or now
-    return Quota(min(full, int(trial_limit_gb() * GB)), False, start, _key("free", start), None, paid_until, bonus)
+    return Quota(0, False, start, _key("free", start), None, paid_until, bonus)
 
 
 def format_gb(value: int) -> str:
@@ -254,8 +256,7 @@ def _when_back(quota: Quota) -> str:
 
 
 def _bonus_hint() -> str:
-    gb = referral_bonus_gb()
-    return f" или когда друг по твоей ссылке активирует триал (+{format_gb(int(gb * GB))} ГБ)" if gb > 0 else ""
+    return " или раньше — с бонусными днями (например, за приглашённого друга)"
 
 
 def status_text(status: BsStatus, emoji: str = "🛡") -> str:
@@ -266,15 +267,25 @@ def status_text(status: BsStatus, emoji: str = "🛡") -> str:
         return f"{title} <b>отключены</b>\n"
     if status.state == "admin_on":
         return f"{title} <b>без лимита</b>\n"
+    if not quota.total and status.state != "exhausted":
+        return (f"{title} <b>0 ГБ</b>\n"
+                f"   ГБ начисляются за дни подписки: после оплаты — полный лимит каждые 30 дней\n")
     if status.state == "exhausted" or (status.used is not None and status.used >= quota.total):
-        what = f"лимит <b>{format_gb(quota.limit)} ГБ</b>" + (" и бонусные ГБ" if quota.bonus else "")
+        if quota.limit:
+            what = f"лимит <b>{format_gb(quota.limit)} ГБ</b>" + (" и бонусные ГБ" if quota.bonus else "")
+        else:
+            what = "бонусные ГБ"
         return (
             f"{title} {what} исчерпаны\n"
             f"   Обычные серверы работают без ограничений. Доступ к белым спискам {_when_back(quota)}"
             f"{_bonus_hint()}\n"
         )
 
-    if status.used is None:
+    if not quota.limit:
+        left = quota.bonus if status.used is None else status.remaining
+        line = f"{title} осталось <b>{format_gb(left)} из {format_gb(quota.bonus)} ГБ</b>" + (
+            " (статистика временно недоступна)" if status.used is None else "") + "\n"
+    elif status.used is None:
         line = f"{title} лимит <b>{format_gb(quota.limit)} ГБ</b> (статистика временно недоступна)\n"
         if quota.bonus:
             line += f"   + бонусные <b>{format_gb(quota.bonus)} ГБ</b> (не сгорают)\n"
@@ -296,9 +307,9 @@ def status_text(status: BsStatus, emoji: str = "🛡") -> str:
     if quota.paid:
         return line + (
             f"   Полный лимит действует по оплаченным дням (до {format_moment(quota.paid_until)}), "
-            f"дальше — {format_gb(int(trial_limit_gb() * GB))} ГБ до продления\n"
+            f"дальше — только бонусные ГБ до продления\n"
         )
-    return line + "   Без оплаты лимит не пополняется — полный лимит каждые 30 дней после оплаты подписки\n"
+    return line + "   ГБ начислены за дни подписки и не сгорают. После оплаты — полный лимит каждые 30 дней\n"
 
 
 # ======================================================
@@ -351,23 +362,64 @@ async def on_payment(panel_api, telegram_id: int, plan: Dict[str, Any]):
     await _ensure_squad(panel_api, subscription["id"])
 
 
-async def on_admin_days(panel_api, subscription_id: int, days: int):
-    """Админ добавил дни — это дни полной подписки (с полным лимитом БС)"""
-    await db.add_bs_paid_days(subscription_id, days, datetime.now(timezone.utc))
-    await _ensure_squad(panel_api, subscription_id)
+async def grant_days(panel_api, subscription_id: int, days: float) -> int:
+    """
+    К подписке добавлены неоплаченные дни (триал, админ, бонусы, подарки) — начислить за них
+    бонусные ГБ по лимиту её тарифа. Возвращает начисленные байты.
+    """
+    subscription = await db.get_subscription(subscription_id)
+    amount = bytes_for_days(subscription and subscription.get("bs_limit_gb"), days)
+    if amount:
+        await grant_bonus(panel_api, subscription_id, amount)
+    return amount
+
+
+async def on_admin_days(panel_api, subscription_id: int, days: int) -> int:
+    """Админ добавил дни — ГБ за них по общему правилу"""
+    return await grant_days(panel_api, subscription_id, days)
+
+
+async def on_admin_reduce(subscription: Dict[str, Any], days: int, now: Optional[datetime] = None):
+    """
+    Админ уменьшил дни (subscription — данные до уменьшения). Дни снимаются с конца срока:
+    сначала неоплаченные (забираем начисленные за них бонусные ГБ, сколько осталось),
+    потом оплаченные (сокращаем оплаченный срок).
+    """
+    now = now or datetime.now(timezone.utc)
+    expiry = _parse_utc(subscription.get("subscription_expiry")) or now
+    paid_until = _parse_utc(subscription.get("bs_paid_until"))
+    unpaid_tail = max(0.0, (expiry - max(now, paid_until or now)).total_seconds() / 86400)
+    from_unpaid = min(float(days), unpaid_tail)
+    amount = bytes_for_days(subscription.get("bs_limit_gb"), from_unpaid)
+    if amount:
+        await db.take_bs_bonus(subscription["id"], amount)
+    from_paid = days - from_unpaid
+    if from_paid > 0 and paid_until and paid_until > now:
+        await db.reduce_bs_paid_days(subscription["id"], from_paid)
 
 
 async def grant_bonus(panel_api, subscription_id: int, amount: int):
     """
-    Начислить бонусные байты. Если лимит уже был исчерпан, а с бонусом снова есть запас —
-    сквад БС возвращается сразу.
+    Начислить бонусные байты. Сквад БС выдаётся сразу (не дожидаясь фоновой проверки): тем, у кого
+    его не было (неоплаченные дни без ГБ), и тем, у кого лимит был исчерпан, а с бонусом снова есть запас.
     """
     await db.add_bs_bonus(subscription_id, amount)
     if not await is_enabled():
         return
+    try:
+        await _apply_bonus(panel_api, subscription_id)
+    except Exception as e:  # ГБ уже начислены — сквад выдаст фоновая проверка
+        logger.error(f"🛡 БС: не удалось сразу выдать сквад подписке {subscription_id}: {e}")
+
+
+async def _apply_bonus(panel_api, subscription_id: int):
     subscription = await db.get_subscription(subscription_id)
     quota = get_quota(subscription)
-    if quota.limit is None or _effective_state(subscription, quota) != "exhausted":
+    state = _effective_state(subscription, quota)
+    if quota.limit is None or state == "admin_off":
+        return
+    if state != "exhausted":
+        await _ensure_squad(panel_api, subscription_id)
         return
     user_id = await _panel_user_id(panel_api, subscription)
     if not user_id:
@@ -379,14 +431,6 @@ async def grant_bonus(panel_api, subscription_id: int, amount: int):
     if used is not None and used < quota.total:
         await db.set_bs_state(subscription_id, None)
         await _add_squad(panel_api, subscription)
-
-
-async def grant_referral_bonus(panel_api, subscription_id: int) -> float:
-    """Бонус за друга, активировавшего триал. Возвращает начисленные ГБ."""
-    gb = referral_bonus_gb()
-    if gb > 0:
-        await grant_bonus(panel_api, subscription_id, int(gb * GB))
-    return gb
 
 
 async def admin_set_user_squad(panel_api, subscription: Dict[str, Any], squad: str, enable: bool) -> bool:
@@ -447,18 +491,18 @@ async def _check_all(panel_api, now: Optional[datetime] = None) -> Optional[Chec
 
     subscriptions = await db.get_bs_subscriptions()
     quotas = {s["id"]: get_quota(s, now) for s in subscriptions}
-    counted = [q for q in quotas.values() if q.limit]
+    counted = [q for q in quotas.values() if q.total]
     if not subscriptions:
         return CheckResult([], [], [], [], [])
 
-    # Кандидаты: трафик с самого раннего начала квоты не меньше 80% минимального лимита.
-    # Окно покрывает квоту любого пользователя, поэтому остальные заведомо в лимите
-    # (бонусы только увеличивают лимит, так что порог по обычному лимиту — с запасом).
+    # Кандидаты: трафик с самого раннего начала квоты не меньше 80% минимального доступного объёма
+    # (лимит + бонусы). Окно покрывает квоту любого пользователя, поэтому остальные заведомо в лимите.
+    # Подписки с нулевым объёмом (неоплаченные дни без бонусов) в порог не входят — им сквад не положен.
     candidates = {}
     if counted:
         window_start = min(q.start for q in counted)
         candidates = await panel_api.get_squad_usage(
-            squad, _day(window_start), _day(now), int(min(q.limit for q in counted) * WARN_SHARE)
+            squad, _day(window_start), _day(now), int(min(q.total for q in counted) * WARN_SHARE)
         )
         if candidates is None:
             return None
@@ -493,6 +537,13 @@ async def _check_all(panel_api, now: Optional[datetime] = None) -> Optional[Chec
             continue
 
         expire = _parse_utc(user.get("expireAt"))
+        if quota.limit is not None and not quota.total and state != "admin_on" and state != "exhausted":
+            # Неоплаченные дни, за которые ГБ не начислялись: сквад не положен, но это не «исчерпал лимит»
+            if in_squad:
+                to_remove.append(user["id"])
+            if sub in restored:
+                restored.remove(sub)
+            continue
         if quota.limit is None or not expire or expire <= now:
             # БС не входят в тариф — снимаем; истёкшую подписку не трогаем (ручное включение админа тоже)
             if in_squad and state != "admin_on" and quota.limit is None:
@@ -577,7 +628,8 @@ async def notify_users(bot, result: CheckResult):
                     f"до {format_moment(quota.paid_until)}.")
         else:
             full = sub.get("bs_limit_gb")
-            tail = f"Оплати подписку — и получишь <b>{full} ГБ</b> белых списков каждые 30 дней."
+            tail = (f"Оплати подписку — и получишь <b>{full} ГБ</b> белых списков каждые 30 дней. "
+                    f"Бонусные дни (например, за приглашённого друга) тоже добавляют ГБ.")
         await _send(bot, sub["telegram_id"], (
             f"🛡 <b>Белые списки: осталось {left} из {format_gb(quota.total)} ГБ</b>\n\n"
             f"Подписка <b>{sub['tariff_name']}</b>. Когда лимит закончится, серверы белых списков "

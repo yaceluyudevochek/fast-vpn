@@ -19,6 +19,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from config import config
 from database import abuse_db
 from database import db
+from services import whitelist
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,8 @@ async def _block(bot, panel_api, sub: Dict[str, Any], others: Set[int], now: dat
     await db.update_subscription_expiry(sub["id"], expiry)
     await db.update_subscription_status(sub["id"], "EXPIRED")
     await _mark(sub["id"], blocked=True)
+    # Все дни подписки сгорели — ГБ белых списков, начисленные за них, тоже
+    await db.take_bs_bonus(sub["id"], whitelist.bonus_left(await db.get_subscription(sub["id"]) or sub))
 
     try:
         await bot.send_message(

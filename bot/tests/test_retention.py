@@ -62,6 +62,8 @@ async def fresh_db():
     path = os.path.join(tempfile.mkdtemp(), "t.db")
     db.DB_PATH = path
     await db.init_db()
+    sql(path, "UPDATE tariff_types SET bs_limit_gb = 30 WHERE id = 1")   # Standart: 1 ГБ в день
+    sql(path, "UPDATE tariff_types SET bs_limit_gb = 60 WHERE id = 2")   # Family: 2 ГБ в день
     await retention.set_enabled(True)
     return path
 
@@ -200,13 +202,13 @@ async def test_gift_on_other_tariff():
     username, days = panel.extended[-1]
     assert username == "tg1_2" and days == 2                                                 # 3 дня Standart → 1.5 → 2 Family
     assert "Premium" in bot.sent[-1][1] and "Мы подарили тебе 2 дня" in bot.sent[-1][1]
-    assert (await db.get_subscription(family))["bs_bonus_bytes"] == 3 * whitelist.GB         # ГБ — фиксированные
+    assert (await db.get_subscription(family))["bs_bonus_bytes"] == 4 * whitelist.GB         # 2 дня × 60 / 30
 
     # Подарок по подписке — не чаще раза в 3 месяца
     later = NOW + timedelta(days=4, hours=2)
     sql(path, "UPDATE subscriptions SET subscription_expiry = ? WHERE id = ?", (iso(later - timedelta(hours=26)), family))
     assert await run(bot, panel, later) == {}
-    print("OK  подарок на тарифе Family: дни пересчитаны по коэффициенту и округлены вверх (3 → 1.5 → 2), ГБ фиксированные, раз в 3 месяца")
+    print("OK  подарок на тарифе Family: дни пересчитаны по коэффициенту и округлены вверх (3 → 1.5 → 2), ГБ за эти дни (2 × 2 = 4), раз в 3 месяца")
 
 
 async def test_blocked_and_stats():

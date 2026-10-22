@@ -63,13 +63,13 @@ async def fresh_db():
     path = os.path.join(tempfile.mkdtemp(), "t.db")
     db.DB_PATH = path
     await db.init_db()
-    # Standart 200 ₽ / 3 устр. / 50 ГБ; Family 300 / 5 / 75; Corporate 500 / 10 / 150
-    sql(path, "UPDATE tariff_types SET name='Standart', squad_id=?, hwid_limit=3, bs_limit_gb=50 WHERE id=1", (STD_SQUAD,))
+    # Standart 200 ₽ / 3 устр. / 30 ГБ; Family 300 / 5 / 60; Corporate 500 / 10 / 120
+    sql(path, "UPDATE tariff_types SET name='Standart', squad_id=?, hwid_limit=3, bs_limit_gb=30 WHERE id=1", (STD_SQUAD,))
     sql(path, "UPDATE tariff_plans SET price = 200 WHERE tariff_type_id = 1 AND days = 30")
-    sql(path, "UPDATE tariff_types SET name='Family', squad_id=?, hwid_limit=5, bs_limit_gb=75, switch_coef=300 WHERE id=2",
+    sql(path, "UPDATE tariff_types SET name='Family', squad_id=?, hwid_limit=5, bs_limit_gb=60, switch_coef=300 WHERE id=2",
         (FAM_SQUAD,))
     sql(path, "INSERT INTO tariff_types (id, name, squad_id, hwid_limit, bs_limit_gb, switch_coef) "
-              "VALUES (3, 'Corporate', ?, 10, 150, 500)", (CORP_SQUAD,))
+              "VALUES (3, 'Corporate', ?, 10, 120, 500)", (CORP_SQUAD,))
     sql(path, "INSERT INTO tariff_plans (tariff_type_id, days, price) VALUES (3, 30, 500)")
     sql(path, "INSERT INTO users (telegram_id) VALUES (1)")
     return path
@@ -109,7 +109,7 @@ async def test_formula_and_switch():
     fields = panel.updates[-1][1]
     assert fields["hwidDeviceLimit"] == 5 and "expireAt" in fields and panel.resets == []
     assert updated["tariff_changed_at"]
-    assert whitelist.get_quota(updated).limit == 75 * whitelist.GB                            # лимит БС нового тарифа
+    assert whitelist.get_quota(updated).limit == 60 * whitelist.GB                            # лимит БС нового тарифа
 
     # Раз в сутки
     allowed, message = tariffs.can_switch(updated)
@@ -195,11 +195,15 @@ async def test_referral_to_family():
     path = await fresh_db()
     panel = FakePanel()
     sid = await std_sub(path, panel)
-    assert await referrals.bonus_label(1) == "+7 дней"                         # Standart — как есть
-    assert await referrals.bonus_label(777) == "+7 дней"                       # без подписки — Standart
+    bs = " к подписке и <b>+{} ГБ</b> к белым спискам"
+    assert await referrals.bonus_text(1) == "<b>+7 дней</b> к подписке"        # БС выключены — без ГБ
+    whitelist.config.BS_SQUAD_UUID = "bs"
+    await whitelist.set_enabled(True)
+    assert await referrals.bonus_text(1) == "<b>+7 дней</b>" + bs.format(7)    # Standart: 7 дней × 30 / 30
+    assert await referrals.bonus_text(777) == "<b>+7 дней</b>" + bs.format(7)  # без подписки — Standart
     await tariffs.switch(panel, sid, 2)
     panel.extended.clear()
-    assert await referrals.bonus_label(1) == "+5 дней тарифа Family"           # экран рефералов = начисление
+    assert await referrals.bonus_text(1) == "<b>+5 дней тарифа Family</b>" + bs.format(10)   # 5 × 60 / 30
 
     class Bot:
         sent = []
@@ -211,7 +215,8 @@ async def test_referral_to_family():
     assert len(await db.get_user_subscriptions(1)) == 1                       # новая подписка не создана
     username, days = panel.extended[0]
     assert username == "tg1_1" and days == 5                                   # 7 дней Standart → 4.67 → 5 Family
-    assert "+5 дней тарифа Family" in bot.sent[-1], bot.sent[-1]
+    assert "+5 дней тарифа Family" in bot.sent[-1] and "+10 ГБ" in bot.sent[-1], bot.sent[-1]
+    assert (await db.get_subscription(sid))["bs_bonus_bytes"] == 10 * whitelist.GB
     sql(path, "INSERT INTO users (telegram_id, referred_by) VALUES (2, 1)")
     await referrals.queue_reward(bot, 2, "Друг2")
     assert "+5 дней тарифа Family" in bot.sent[-1] and "начислится" in bot.sent[-1]
@@ -229,20 +234,20 @@ async def test_bs_limit_upgrade_next_period():
     sid = await std_sub(path, panel, remaining=100 * DAY, paid=100 * DAY, now=now)   # Corporate: 40 оплаченных дней
     sql(path, "UPDATE subscriptions SET bs_period_anchor = ? WHERE id = ?", (tariffs.sql_ts(now - 5 * DAY), sid))
     sub = await db.get_subscription(sid)
-    assert await whitelist._sync_quota(panel, sub, whitelist.get_quota(sub, now), 1)        # период запомнен: 50 ГБ
+    assert await whitelist._sync_quota(panel, sub, whitelist.get_quota(sub, now), 1)        # период запомнен: 30 ГБ
 
     sub = await tariffs.switch(panel, sid, 3, now)                                           # Standart → Corporate
     q = whitelist.get_quota(sub, now)
-    assert q.limit == 50 * whitelist.GB and q.upcoming_limit == 150 * whitelist.GB
+    assert q.limit == 30 * whitelist.GB and q.upcoming_limit == 120 * whitelist.GB
     status = whitelist.BsStatus(quota=q, used=10 * whitelist.GB, state=None)
-    assert "Лимит нового тарифа 150 ГБ начнёт действовать" in whitelist.status_text(status)
+    assert "Лимит нового тарифа 120 ГБ начнёт действовать" in whitelist.status_text(status)
 
     later = now + 26 * DAY                                                                   # новый 30-дневный период
     q2 = whitelist.get_quota(sub, later)
-    assert q2.limit == 150 * whitelist.GB and q2.upcoming_limit is None
+    assert q2.limit == 120 * whitelist.GB and q2.upcoming_limit is None
 
     sub = await tariffs.switch(panel, sid, 1, now)                                           # обратно на Standart
-    assert whitelist.get_quota(sub, now).limit == 50 * whitelist.GB                          # меньший — сразу
+    assert whitelist.get_quota(sub, now).limit == 30 * whitelist.GB                          # меньший — сразу
     from handlers.admin_promo import _scope_warning
     family_plans = [p["id"] for p in await db.get_tariff_plans(2)]
     all_plans = [p["id"] for t in (1, 2, 3) for p in await db.get_tariff_plans(t)]

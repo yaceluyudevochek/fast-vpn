@@ -389,6 +389,21 @@ async def _m014_trial_by_device(db):
     await _add_column(db, "subscriptions_archive", "trial_blocked_at", "TIMESTAMP")
 
 
+async def _m015_whitelist_gb_per_day(db):
+    """
+    БС: каждый день подписки даёт лимит тарифа / 30 ГБ. Разового пула для неоплаченных дней больше нет —
+    за уже идущие неоплаченные дни (триал, бонусы) начисляем бонусные ГБ по новому правилу.
+    """
+    await db.execute("""
+        UPDATE subscriptions SET bs_bonus_bytes = COALESCE(bs_bonus_bytes, 0) + CAST(
+            (julianday(subscription_expiry) - julianday(MAX(datetime('now'), COALESCE(bs_paid_until, datetime('now')))))
+            * (SELECT bs_limit_gb FROM tariff_types t WHERE t.id = subscriptions.tariff_type_id)
+            * 1073741824 / 30 AS INTEGER)
+        WHERE (SELECT bs_limit_gb FROM tariff_types t WHERE t.id = subscriptions.tariff_type_id) > 0
+          AND julianday(subscription_expiry) > julianday(MAX(datetime('now'), COALESCE(bs_paid_until, datetime('now'))))
+    """)
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -404,6 +419,7 @@ _MIGRATIONS = [
     (12, _m012_session_flags),
     (13, _m013_one_subscription),
     (14, _m014_trial_by_device),
+    (15, _m015_whitelist_gb_per_day),
 ]
 
 
@@ -1130,6 +1146,15 @@ async def add_bs_bonus(subscription_id: int, amount: int):
         await db.commit()
 
 
+async def take_bs_bonus(subscription_id: int, amount: int):
+    """Забрать бонусные байты белых списков (не больше, чем осталось)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE subscriptions SET bs_bonus_bytes = MAX(bs_bonus_used, bs_bonus_bytes - ?) WHERE id = ?
+        """, (int(amount), subscription_id))
+        await db.commit()
+
+
 async def close_bs_quota(subscription_id: int, bonus_spent: int, key: str, start: str, limit: int):
     """Квота сменилась: списать потраченные в закрытой квоте бонусы и запомнить новую квоту"""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1149,13 +1174,13 @@ async def set_bs_warned(subscription_id: int, quota_key: str):
         await db.commit()
 
 
-async def reduce_bs_paid_days(subscription_id: int, days: int):
+async def reduce_bs_paid_days(subscription_id: int, days: float):
     """Админ уменьшил дни подписки — уменьшаем и оплаченный срок"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             UPDATE subscriptions SET bs_paid_until = datetime(bs_paid_until, ?)
             WHERE id = ? AND bs_paid_until IS NOT NULL
-        """, (f"-{int(days)} days", subscription_id))
+        """, (f"-{int(round(days * 86400))} seconds", subscription_id))
         await db.commit()
 
 

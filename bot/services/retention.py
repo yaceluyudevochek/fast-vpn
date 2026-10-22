@@ -4,7 +4,7 @@
 Сегменты (у каждого сообщения своё окно — давно ушедшим ничего не шлём):
   winback        — платная подписка истекла (по каждой подписке отдельно: истекла Family при действующей
                    Standart — тоже): через 24 ч (до 7 дней) дарим RETENTION_GIFT_DAYS дней к этой подписке
-                   + RETENTION_GIFT_GB ГБ белых списков (бонусом, как за друга);
+                   + ГБ белых списков за эти дни (лимит тарифа / 30 × дни, как за любые дни);
   trial_expired  — не платил, подписка (триал) истекла: через 24 ч рассказываем о подписке,
                    ещё через 24 ч — тот же подарок;
   trial_idle     — триал идёт, а подключения (>= 50 МБ трафика) нет: помощь на 1-й и 2-й день;
@@ -18,7 +18,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram.types import InlineKeyboardMarkup
 
@@ -58,8 +58,6 @@ def gift_days() -> int:
     return getattr(config, "RETENTION_GIFT_DAYS", 3)
 
 
-def gift_gb() -> float:
-    return getattr(config, "RETENTION_GIFT_GB", 3)
 
 
 def gift_cooldown() -> timedelta:
@@ -107,11 +105,18 @@ def _keyboard(kind: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _context(tariff: str = "") -> Dict[str, Any]:
-    gb = gift_gb()
-    bs = f" и {whitelist.format_gb(int(gb * whitelist.GB))} ГБ белых списков" if gb > 0 and await whitelist.is_enabled() else ""
-    return {"tariff": tariff, "gift_days": _days_word(gift_days()), "gift_bs": bs,
+async def _gift_bs(amount: int) -> str:
+    return f" и {whitelist.format_gb(amount)} ГБ белых списков" if amount > 0 and await whitelist.is_enabled() else ""
+
+
+async def _context(tariff: str = "", gift_bytes: int = 0) -> Dict[str, Any]:
+    return {"tariff": tariff, "gift_days": _days_word(gift_days()), "gift_bs": await _gift_bs(gift_bytes),
             "min_price": await retention_db.min_month_price() or "—"}
+
+
+async def _gift_ctx(ctx: Dict[str, Any], gift: Tuple[int, int]) -> Dict[str, Any]:
+    days, amount = gift
+    return {**ctx, "gift_days": _days_word(days), "gift_bs": await _gift_bs(amount)}
 
 
 _BLOCKED_MARKERS = ("blocked", "deactivated", "chat not found", "user not found", "kicked")
@@ -141,8 +146,11 @@ async def _gift_allowed(subscription_id: int, now: datetime) -> bool:
     return last is None or now - last >= gift_cooldown()
 
 
-async def _gift(panel_api, sub: Dict[str, Any]) -> Optional[int]:
-    """Продлить подписку на подарочные дни и начислить бонусные ГБ белых списков. Возвращает начисленные дни."""
+async def _gift(panel_api, sub: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    """
+    Продлить подписку на подарочные дни и начислить ГБ белых списков за эти дни.
+    Возвращает (дни, байты БС) или None.
+    """
     from services import tariffs
     days = await tariffs.bonus_days(await db.get_subscription(sub["id"]), gift_days())   # дни Standart → дни тарифа
     new_expiry = await panel_api.extend_subscription_by_username(sub["username_in_panel"], days)
@@ -151,12 +159,12 @@ async def _gift(panel_api, sub: Dict[str, Any]) -> Optional[int]:
         return None
     await db.update_subscription_expiry(sub["id"], new_expiry)
     await db.update_subscription_status(sub["id"], "ACTIVE")
-    if gift_gb() > 0:
-        try:
-            await whitelist.grant_bonus(panel_api, sub["id"], int(gift_gb() * whitelist.GB))
-        except Exception as e:
-            logger.error(f"Возврат клиентов: не удалось начислить бонус БС подписке {sub['id']}: {e}")
-    return days
+    amount = 0
+    try:
+        amount = await whitelist.grant_days(panel_api, sub["id"], days)
+    except Exception as e:
+        logger.error(f"Возврат клиентов: не удалось начислить бонус БС подписке {sub['id']}: {e}")
+    return days, amount
 
 
 # ======================================================
@@ -226,11 +234,11 @@ async def _process_expired(bot, panel_api, user: Dict[str, Any], sub: Dict[str, 
             return None
         if await retention_db.has_event(tid, "winback", "gift", ref) or not await _gift_allowed(sub["id"], now):
             return None
-        days = await _gift(panel_api, sub)
-        if not days:
+        gift = await _gift(panel_api, sub)
+        if not gift:
             return None
         await retention_db.record_event(tid, "winback", "gift", ref, sub["id"])
-        await _send(bot, tid, texts.WINBACK_GIFT.format(**{**ctx, "gift_days": _days_word(days)}), _keyboard("winback"))
+        await _send(bot, tid, texts.WINBACK_GIFT.format(**await _gift_ctx(ctx, gift)), _keyboard("winback"))
         return "winback:gift"
 
     # Бесплатная подписка (триал, бонусы) у того, кто платил или ещё чем-то пользуется, — не трогаем;
@@ -250,11 +258,11 @@ async def _process_expired(bot, panel_api, user: Dict[str, Any], sub: Dict[str, 
             and now - promo_at >= MIN_GAP
             and not await retention_db.has_event(tid, "trial_expired", "gift", ref)
             and await _gift_allowed(sub["id"], now)):
-        days = await _gift(panel_api, sub)
-        if not days:
+        gift = await _gift(panel_api, sub)
+        if not gift:
             return None
         await retention_db.record_event(tid, "trial_expired", "gift", ref, sub["id"])
-        await _send(bot, tid, texts.TRIAL_EXPIRED_GIFT.format(**{**ctx, "gift_days": _days_word(days)}), _keyboard("trial_gift"))
+        await _send(bot, tid, texts.TRIAL_EXPIRED_GIFT.format(**await _gift_ctx(ctx, gift)), _keyboard("trial_gift"))
         return "trial_expired:gift"
     return None
 
@@ -286,7 +294,8 @@ async def run(bot, panel_api, now: Optional[datetime] = None, ignore_hours: bool
 
 async def send_previews(bot, chat_id: int):
     """Прислать админу все черновики сообщений с примерными подстановками"""
-    ctx = await _context("Default")
+    base = await db.get_tariff_type(1) or {}
+    ctx = await _context(base.get("name") or "Standart", whitelist.bytes_for_days(base.get("bs_limit_gb"), gift_days()))
     previews: List[tuple] = [
         ("1. Не продлил платную подписку (через 24 ч, подарок)", texts.WINBACK_GIFT.format(**ctx), "winback"),
         ("2a. Триал закончился (через 24 ч)", texts.TRIAL_EXPIRED_PROMO.format(**ctx), "trial_promo"),

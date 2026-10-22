@@ -1198,11 +1198,11 @@ async def process_add_days(message: Message, state: FSMContext):
     if new_expiry:
         # Обновляем в БД
         await database.update_subscription_expiry(subscription_id, new_expiry)
-        # Дни от админа — дни полной подписки (полный лимит белых списков)
+        # ГБ белых списков за добавленные дни (лимит тарифа / 30 × дни)
         try:
             await whitelist.on_admin_days(panel_api, subscription_id, days)
         except Exception as e:
-            logger.error(f"Whitelist paid days update failed for subscription {subscription_id}: {e}")
+            logger.error(f"Whitelist bonus for admin days failed for subscription {subscription_id}: {e}")
 
         # Форматируем дату
         from datetime import datetime, timedelta
@@ -2161,7 +2161,7 @@ async def confirm_reduce_days(callback: CallbackQuery, state: FSMContext):
     if new_expiry:
         # Обновляем в БД
         await database.update_subscription_expiry(subscription_id, new_expiry)
-        await database.reduce_bs_paid_days(subscription_id, days)
+        await whitelist.on_admin_reduce(subscription, days)
 
         # Проверяем, не истекла ли подписка после уменьшения
         updated_info = await panel_api.format_subscription_info_by_short_uuid(subscription['short_uuid'])

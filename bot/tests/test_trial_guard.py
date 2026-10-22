@@ -86,11 +86,14 @@ async def main():
     await trial_user(path, panel, 15, timedelta(hours=5), hwid="PHONE", paid=True)  # платил — не трогаем
     sql(path, "UPDATE users SET referred_by = 10 WHERE telegram_id = 11")
     await referral_db.queue(10, 11, "Альт")
+    sql(path, "UPDATE subscriptions SET bs_bonus_bytes = 3 * 1073741824 WHERE id IN (?, ?)", (second, own))  # ГБ за 3 дня
 
     result = await trial_guard.check(bot, panel)
     assert result == {"blocked": 1, "checked": 2}, result
     blocked = await db.get_subscription(second)
     assert blocked["trial_blocked_at"] and blocked["status"] == "EXPIRED"
+    assert blocked["bs_bonus_bytes"] == 0                                         # ГБ за сгоревшие дни забраны
+    assert (await db.get_subscription(own))["bs_bonus_bytes"] == 3 * 1073741824
     assert panel.updates[0][0] == "tg11_1" and "expireAt" in panel.updates[0][1]
     assert any(c == 11 and "уже был использован" in t for c, t in bot.sent)
     alert = next(t for c, t in bot.sent if c == ADMIN)

@@ -468,6 +468,12 @@ async def select_tariff(callback: CallbackQuery):
 # АКТИВАЦИЯ ТРИАЛА (с созданием подписки для реферера)
 # ==========================================================
 
+async def _trial_gb_line(amount: int) -> str:
+    if amount <= 0 or not await whitelist.is_enabled():
+        return ""
+    return f"{E['shield']} Белые списки: <b>+{whitelist.format_gb(amount)} ГБ</b>\n"
+
+
 @router.callback_query(F.data == "activate_trial")
 async def activate_trial(callback: CallbackQuery):
     user = callback.from_user
@@ -519,6 +525,7 @@ async def activate_trial(callback: CallbackQuery):
 
             # Отмечаем, что триал использован (но подписка та же)
             await database.mark_subscription_trial_used(existing_sub['id'])
+            trial_gb = await whitelist.grant_days(panel_api, existing_sub['id'], trial_days)
 
             # Форматируем дату
             date_obj = datetime.fromisoformat(new_expiry.replace('Z', '+00:00'))
@@ -537,6 +544,7 @@ async def activate_trial(callback: CallbackQuery):
             text = (
                 f"{E['check']} <b>Пробный период активирован!</b>\n\n"
                 f"{E['calendar']} К текущей подписке добавлено <b>+{tariffs.plural_days(trial_days)}</b>\n"
+                + await _trial_gb_line(trial_gb) +
                 f"{E['calendar']} Новая дата окончания: <b>{formatted_date}</b>\n"
                 f"{E['link']} Ссылка для подключения:\n"
                 f"{link}"
@@ -583,6 +591,7 @@ async def activate_trial(callback: CallbackQuery):
                 username_in_panel,
                 trial=True
             )
+            trial_gb = await whitelist.grant_days(panel_api, subscription_id, 3)
 
             await referrals.queue_reward(callback.bot, user.id, user.first_name)  # награда — после подключения друга
 
@@ -596,6 +605,7 @@ async def activate_trial(callback: CallbackQuery):
             text = (
                 f"{E['check']} <b>Пробный период активирован!</b>\n\n"
                 f"{E['calendar']} Срок: <b>3 дня</b>\n"
+                + await _trial_gb_line(trial_gb) +
                 f"{E['link']} Ссылка для подключения:\n"
                 f"{link}"
             )
@@ -1178,9 +1188,7 @@ async def get_link(callback: CallbackQuery):
         [kb_button("back", "Назад", callback_data="back_to_main")]
     ])
 
-    bonus_text = f"<b>{await referrals.bonus_label(user.id)}</b> к подписке"
-    if await whitelist.is_enabled() and whitelist.referral_bonus_gb() > 0:
-        bonus_text += f" и <b>+{whitelist.format_gb(int(whitelist.referral_bonus_gb() * whitelist.GB))} ГБ</b> к белым спискам"
+    bonus_text = await referrals.bonus_text(user.id)
     waiting = await referral_db.pending_count(user.id)
 
     stats_text = (
