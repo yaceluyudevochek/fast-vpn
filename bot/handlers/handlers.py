@@ -1178,7 +1178,7 @@ async def get_link(callback: CallbackQuery):
         [kb_button("back", "Назад", callback_data="back_to_main")]
     ])
 
-    bonus_text = f"<b>+{referrals.REFERRAL_BONUS_DAYS} дней</b> к подписке"
+    bonus_text = f"<b>{await referrals.bonus_label(user.id)}</b> к подписке"
     if await whitelist.is_enabled() and whitelist.referral_bonus_gb() > 0:
         bonus_text += f" и <b>+{whitelist.format_gb(int(whitelist.referral_bonus_gb() * whitelist.GB))} ГБ</b> к белым спискам"
     waiting = await referral_db.pending_count(user.id)

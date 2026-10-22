@@ -195,8 +195,11 @@ async def test_referral_to_family():
     path = await fresh_db()
     panel = FakePanel()
     sid = await std_sub(path, panel)
+    assert await referrals.bonus_label(1) == "+7 дней"                         # Standart — как есть
+    assert await referrals.bonus_label(777) == "+7 дней"                       # без подписки — Standart
     await tariffs.switch(panel, sid, 2)
     panel.extended.clear()
+    assert await referrals.bonus_label(1) == "+5 дней тарифа Family"           # экран рефералов = начисление
 
     class Bot:
         sent = []
@@ -209,7 +212,11 @@ async def test_referral_to_family():
     username, days = panel.extended[0]
     assert username == "tg1_1" and days == 5                                   # 7 дней Standart → 4.67 → 5 Family
     assert "+5 дней тарифа Family" in bot.sent[-1], bot.sent[-1]
-    print("OK  награда за друга идёт на единственную подписку (Family), дни пересчитаны по коэффициенту")
+    sql(path, "INSERT INTO users (telegram_id, referred_by) VALUES (2, 1)")
+    await referrals.queue_reward(bot, 2, "Друг2")
+    assert "+5 дней тарифа Family" in bot.sent[-1] and "начислится" in bot.sent[-1]
+    print("OK  награда за друга идёт на единственную подписку (Family), дни пересчитаны по коэффициенту; "
+          "экран рефералов и сообщения показывают то же число")
 
 
 async def test_bs_limit_upgrade_next_period():

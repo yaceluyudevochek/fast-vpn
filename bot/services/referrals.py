@@ -26,6 +26,19 @@ logger = logging.getLogger(__name__)
 REFERRAL_BONUS_DAYS = 7
 
 
+def days_label_for(subscription: Optional[Dict[str, Any]], days: int) -> str:
+    """«+7 дней» на Standart (или без подписки), «+5 дней тарифа Family» на другом тарифе"""
+    if subscription and subscription["tariff_type_id"] != tariffs.BASE_TARIFF_ID:
+        return f"+{tariffs.plural_days(days)} тарифа {html.escape(subscription['tariff_name'])}"
+    return f"+{tariffs.plural_days(days)}"
+
+
+async def bonus_label(telegram_id: int) -> str:
+    """Сколько дней за друга получит этот человек — в днях его тарифа (как и будет начислено)"""
+    subscription = await database.get_user_main_subscription(telegram_id)
+    return days_label_for(subscription, await tariffs.bonus_days(subscription, REFERRAL_BONUS_DAYS))
+
+
 def wait_days() -> int:
     return getattr(config, "REFERRAL_WAIT_DAYS", 3)
 
@@ -57,7 +70,7 @@ async def queue_reward(bot, friend_id: int, friend_name: str):
     await _send(bot, referrer_id, (
         f"🎉 <b>У вас новый реферал!</b>\n\n"
         f"Пользователь {html.escape(friend_name or str(friend_id))} активировал пробный период.\n"
-        f"🎁 Бонус <b>+{REFERRAL_BONUS_DAYS} дней</b>{bonus} начислится, как только он подключится к VPN."
+        f"🎁 Бонус <b>{await bonus_label(referrer_id)}</b>{bonus} начислится, как только он подключится к VPN."
     ))
 
 
@@ -75,12 +88,11 @@ async def grant(bot, panel_api, referrer_id: int, friend_name: str) -> Optional[
     base_username = f"tg{referrer_id}_1"
     referrer_sub = await database.get_user_main_subscription(referrer_id)
     base_id = None
-    days_label = f"+{REFERRAL_BONUS_DAYS} дней"
+    days_label = days_label_for(None, REFERRAL_BONUS_DAYS)
     if referrer_sub:
         base_id = referrer_sub['id']
         days = await tariffs.bonus_days(referrer_sub, REFERRAL_BONUS_DAYS)
-        if referrer_sub['tariff_type_id'] != tariffs.BASE_TARIFF_ID:
-            days_label = f"+{tariffs.plural_days(days)} тарифа {html.escape(referrer_sub['tariff_name'])}"
+        days_label = days_label_for(referrer_sub, days)
         new_expiry = await panel_api.extend_subscription_by_username(referrer_sub['username_in_panel'], days)
         if new_expiry:
             await database.update_subscription_expiry(base_id, new_expiry)
