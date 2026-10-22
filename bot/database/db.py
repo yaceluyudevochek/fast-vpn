@@ -381,6 +381,14 @@ async def _m013_one_subscription(db):
         await db.execute("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
 
 
+async def _m014_trial_by_device(db):
+    """Триал по устройству: проверено ли устройство триальщика, заблокирован ли повторный триал"""
+    await _add_column(db, "subscriptions", "trial_device_checked", "INTEGER")
+    await _add_column(db, "subscriptions", "trial_blocked_at", "TIMESTAMP")
+    await _add_column(db, "subscriptions_archive", "trial_device_checked", "INTEGER")
+    await _add_column(db, "subscriptions_archive", "trial_blocked_at", "TIMESTAMP")
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -395,6 +403,7 @@ _MIGRATIONS = [
     (11, _m011_referral_rewards),
     (12, _m012_session_flags),
     (13, _m013_one_subscription),
+    (14, _m014_trial_by_device),
 ]
 
 

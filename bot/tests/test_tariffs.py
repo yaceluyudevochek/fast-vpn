@@ -212,12 +212,48 @@ async def test_referral_to_family():
     print("OK  награда за друга идёт на единственную подписку (Family), дни пересчитаны по коэффициенту")
 
 
+async def test_bs_limit_upgrade_next_period():
+    """«Съездить на день в Corporate» ради лимита белых списков нельзя: больший лимит — со следующего периода"""
+    path = await fresh_db()
+    panel = FakePanel()
+    whitelist.config.BS_SQUAD_UUID = "bs"
+    await whitelist.set_enabled(True)
+    now = datetime.now(timezone.utc)
+    sid = await std_sub(path, panel, remaining=100 * DAY, paid=100 * DAY, now=now)   # Corporate: 40 оплаченных дней
+    sql(path, "UPDATE subscriptions SET bs_period_anchor = ? WHERE id = ?", (tariffs.sql_ts(now - 5 * DAY), sid))
+    sub = await db.get_subscription(sid)
+    assert await whitelist._sync_quota(panel, sub, whitelist.get_quota(sub, now), 1)        # период запомнен: 50 ГБ
+
+    sub = await tariffs.switch(panel, sid, 3, now)                                           # Standart → Corporate
+    q = whitelist.get_quota(sub, now)
+    assert q.limit == 50 * whitelist.GB and q.upcoming_limit == 150 * whitelist.GB
+    status = whitelist.BsStatus(quota=q, used=10 * whitelist.GB, state=None)
+    assert "Лимит нового тарифа 150 ГБ начнёт действовать" in whitelist.status_text(status)
+
+    later = now + 26 * DAY                                                                   # новый 30-дневный период
+    q2 = whitelist.get_quota(sub, later)
+    assert q2.limit == 150 * whitelist.GB and q2.upcoming_limit is None
+
+    sub = await tariffs.switch(panel, sid, 1, now)                                           # обратно на Standart
+    assert whitelist.get_quota(sub, now).limit == 50 * whitelist.GB                          # меньший — сразу
+    from handlers.admin_promo import _scope_warning
+    family_plans = [p["id"] for p in await db.get_tariff_plans(2)]
+    all_plans = [p["id"] for t in (1, 2, 3) for p in await db.get_tariff_plans(t)]
+    warning = await _scope_warning(family_plans)
+    assert "Standart" in warning and "Corporate" in warning and "Family" not in warning.split("не действует на:")[1].split(".")[0]
+    assert await _scope_warning(all_plans) == "" and await _scope_warning([]) == ""
+    await whitelist.set_enabled(False)
+    print("OK  повышение тарифа: больший лимит БС — со следующего периода, понижение — сразу; "
+          "мастер промокодов предупреждает, если код не на все тарифы")
+
+
 async def main():
     await test_formula_and_switch()
     await test_round_trip_and_downgrade()
     await test_payment_for_other_tariff()
     await test_bonus_days_and_archive()
     await test_referral_to_family()
+    await test_bs_limit_upgrade_next_period()
 
 
 if __name__ == "__main__":

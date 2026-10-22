@@ -28,7 +28,7 @@ async def get_audience() -> List[Dict[str, Any]]:
             users = [dict(row) for row in await cursor.fetchall()]
         async with db.execute("""
             SELECT id, telegram_id, username_in_panel, subscription_expiry, trial_used, created_at, status,
-                   bs_paid_until
+                   bs_paid_until, trial_blocked_at
             FROM subscriptions WHERE status != 'DISABLED'
         """) as cursor:
             subs = defaultdict(list)

@@ -233,8 +233,9 @@ async def _process_expired(bot, panel_api, user: Dict[str, Any], sub: Dict[str, 
         await _send(bot, tid, texts.WINBACK_GIFT.format(**{**ctx, "gift_days": _days_word(days)}), _keyboard("winback"))
         return "winback:gift"
 
-    # Бесплатная подписка (триал, бонусы) у того, кто платил или ещё чем-то пользуется, — не трогаем
-    if user["has_paid"] or has_active:
+    # Бесплатная подписка (триал, бонусы) у того, кто платил или ещё чем-то пользуется, — не трогаем;
+    # повторный триал на том же устройстве (заблокирован) — тоже без подарка
+    if user["has_paid"] or has_active or sub.get("trial_blocked_at"):
         return None
 
     # 2. Триал закончился, не купил: сначала рассказ о подписке, через сутки — подарок

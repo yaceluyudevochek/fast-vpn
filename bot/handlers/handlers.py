@@ -773,6 +773,18 @@ async def render_renew_plan(target, user_id: int, plan_id: int, subscription_id:
 # СМЕНА ТАРИФА (одна подписка на аккаунт, остаток не сгорает)
 # ==========================================================
 
+async def bs_upgrade_note(subscription: dict, new_type: dict) -> str:
+    """При повышении тарифа посреди оплаченного периода больший лимит белых списков — со следующего периода"""
+    if not await whitelist.is_enabled() or not subscription:
+        return ""
+    old_gb, new_gb = subscription.get('bs_limit_gb') or 0, new_type.get('bs_limit_gb') or 0
+    quota = whitelist.get_quota(subscription)
+    if new_gb <= old_gb or not quota.paid or not quota.refresh_at:
+        return ""
+    return (f"{E['shield']} Лимит белых списков {new_gb} ГБ начнёт действовать с нового периода — "
+            f"{whitelist.format_moment(quota.refresh_at)}, до этого остаётся {old_gb} ГБ.\n")
+
+
 async def _tariff_line(tariff_type: dict) -> str:
     line = f"{tariff_type['hwid_limit']} устройств"
     if tariff_type.get('bs_limit_gb') and await whitelist.is_enabled():
@@ -792,6 +804,7 @@ async def switch_note(subscription, plan: dict) -> str:
         text += (f": оставшиеся {tariffs.days_text(pv.remaining_old)} станут "
                  f"<b>{tariffs.days_text(pv.remaining_new)}</b>, и к ним добавится {plan['days']} дней")
     text += ". Ссылка подписки останется прежней.\n"
+    text += await bs_upgrade_note(subscription, pv.new_type)
     if pv.devices_reset:
         text += f"{E['warn']} Устройств станет меньше — подключённые устройства будут сброшены.\n"
     return text + "\n"
@@ -854,6 +867,7 @@ async def switch_tariff_confirm(callback: CallbackQuery):
         f"Станет: <b>{pv.new_type['name']}</b> — {await _tariff_line(pv.new_type)}, "
         f"осталось <b>{tariffs.days_text(pv.remaining_new)}</b>\n\n"
     )
+    text += await bs_upgrade_note(subscription, pv.new_type)
     if pv.devices_reset:
         text += (f"{E['warn']} В новом тарифе меньше устройств, поэтому все подключённые устройства будут сброшены — "
                  f"подключи заново нужные (не больше {pv.new_type['hwid_limit']}).\n\n")

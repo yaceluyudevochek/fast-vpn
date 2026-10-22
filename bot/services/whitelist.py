@@ -102,6 +102,7 @@ class Quota:
     refresh_at: Optional[datetime] = None  # оплаченные дни: когда лимит обновится
     paid_until: Optional[datetime] = None
     bonus: int = 0                 # остаток бонусных байт (тратится сверх обычного лимита)
+    upcoming_limit: Optional[int] = None   # больший лимит нового тарифа — со следующего периода
 
     @property
     def total(self) -> Optional[int]:
@@ -129,7 +130,14 @@ def get_quota(subscription: Dict[str, Any], now: Optional[datetime] = None) -> Q
     paid_until = _parse_utc(subscription.get("bs_paid_until"))
     if paid_until and now < paid_until:
         start, refresh_at = current_period(subscription.get("bs_period_anchor"), now)
-        return Quota(full, True, start, _key("paid", start), refresh_at, paid_until, bonus)
+        key = _key("paid", start)
+        # Тариф повысили посреди периода: больший лимит — только со следующего периода, иначе можно
+        # «съездить» на день на дорогой тариф ради его месячного лимита белых списков
+        upcoming = None
+        recorded = subscription.get("bs_quota_limit")
+        if subscription.get("bs_quota_key") == key and recorded is not None and int(recorded) < full:
+            upcoming, full = full, int(recorded)
+        return Quota(full, True, start, key, refresh_at, paid_until, bonus, upcoming)
 
     # Неоплаченные дни: разовый пул с конца оплаченного срока (или с начала триала)
     start = paid_until or _parse_utc(subscription.get("bs_period_anchor")) \
@@ -280,6 +288,9 @@ def status_text(status: BsStatus, emoji: str = "🛡") -> str:
             f"осталось <b>{format_gb(status.remaining)} из {format_gb(quota.bonus)} ГБ</b>\n"
         )
 
+    if quota.upcoming_limit:
+        line += (f"   Лимит нового тарифа {format_gb(quota.upcoming_limit)} ГБ начнёт действовать "
+                 f"{format_moment(quota.refresh_at)}\n")
     if quota.refresh_is_full:
         return line + f"   Лимит обновится {format_moment(quota.refresh_at)}\n"
     if quota.paid:

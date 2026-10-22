@@ -169,6 +169,11 @@ async def process_pending(bot, panel_api, now: Optional[datetime] = None) -> Dic
     result = {"granted": 0, "shared_device": 0, "expired": 0}
     skip = await abuse_db.admin_ids() | await abuse_db.ignored()
     for reward in await referral_db.pending():
+        friend_sub = await database.get_user_main_subscription(reward["friend_id"])
+        if friend_sub and friend_sub.get("trial_blocked_at"):
+            await referral_db.set_status(reward["id"], "expired", "повторный триал на том же устройстве")
+            result["expired"] += 1
+            continue
         friend_devices = await _devices_of(panel_api, reward["friend_id"])
         if friend_devices is None:
             continue  # панель не ответила — проверим в следующий раз

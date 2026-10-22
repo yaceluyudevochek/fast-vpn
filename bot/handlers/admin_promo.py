@@ -382,6 +382,28 @@ async def promo_step_first_only(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+async def _scope_warning(selected) -> str:
+    """
+    Код действует не на все тарифы — скидка может «перетечь»: купил со скидкой тариф из области
+    действия, бесплатно перешёл на другой — остаток пересчитан по полному коэффициенту.
+    """
+    selected = set(selected or [])
+    if not selected:
+        return ""
+    excluded = []
+    for tariff_type in await database.get_all_tariff_types():
+        plan_ids = {plan["id"] for plan in await database.get_tariff_plans(tariff_type["id"])}
+        if plan_ids and not plan_ids & selected:
+            excluded.append(tariff_type["name"])
+    if not excluded:
+        return ""
+    return (
+        f"\n\n⚠️ <b>Код не действует на: {', '.join(excluded)}.</b> Купив со скидкой тариф из списка, "
+        "человек может бесплатно перейти на другой тариф — остаток пересчитается по полной цене, "
+        "и скидка фактически перейдёт на тариф без скидки. Безопаснее давать одинаковую скидку на все тарифы."
+    )
+
+
 async def _render_scope(message: Message, state: FSMContext, edit: bool):
     """Выбор тарифов и планов, на которые действует промокод"""
     data = await state.get_data()
@@ -405,7 +427,7 @@ async def _render_scope(message: Message, state: FSMContext, edit: bool):
         "На какие тарифы и планы действует промокод?\n\n"
         "Отметьте нужные. Если не отметить ничего, промокод будет действовать на <b>все планы</b>, "
         "включая те, что появятся позже."
-    )
+    ) + await _scope_warning(selected)
     if edit:
         await message.edit_text(text, reply_markup=_kb(rows), parse_mode="HTML")
     else:
@@ -505,7 +527,7 @@ async def _show_confirm(message: Message, state: FSMContext):
         lines.append(f"Комиссия: {f'{commission:g}%' if commission is not None else 'не задана'}")
 
     await message.answer(
-        "\n".join(lines),
+        "\n".join(lines) + await _scope_warning(data.get("plan_ids")),
         reply_markup=_kb([[_btn("✅ Создать", "promo_adm_create"), _btn("❌ Отмена", "admin_promos")]]),
         parse_mode="HTML"
     )

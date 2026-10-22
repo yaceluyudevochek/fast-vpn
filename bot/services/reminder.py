@@ -91,6 +91,8 @@ class SubscriptionReminder:
         if self.panel_api is None or now - self._last_referral_check < getattr(config, "REFERRAL_CHECK_INTERVAL", 600):
             return
         self._last_referral_check = now
+        from services import trial_guard
+        await trial_guard.check(self.bot, self.panel_api)       # сначала — повторные триалы на том же устройстве
         await referrals.process_pending(self.bot, self.panel_api)
 
     async def _check_sessions(self):
