@@ -330,7 +330,7 @@ async def _ensure_squad(panel_api, subscription_id: int):
 
 async def on_payment(panel_api, telegram_id: int, plan: Dict[str, Any]):
     """Оплата: дни плана становятся оплаченными (досрочное продление лимит не обновляет)"""
-    subscription = await db.get_user_subscription_by_tariff_type(telegram_id, plan["tariff_type_id"])
+    subscription = await db.get_user_main_subscription(telegram_id)
     if not subscription:
         return
     await db.add_bs_paid_days(

@@ -19,6 +19,7 @@ from config import config
 from database import abuse_db, referral_db
 from database import db as database
 from services import whitelist
+from services import tariffs
 
 logger = logging.getLogger(__name__)
 
@@ -66,19 +67,21 @@ async def queue_reward(bot, friend_id: int, friend_name: str):
 
 async def grant(bot, panel_api, referrer_id: int, friend_name: str) -> Optional[int]:
     """
-    +7 дней к базовой подписке пригласившего (создаём её, если нет) и бонусные ГБ белых списков.
-    Возвращает id базовой подписки (None — панель не ответила).
+    +7 дней (в днях Standart, пересчитанных по коэффициенту в тариф подписки) к подписке пригласившего
+    (создаём Standart, если подписки нет) и бонусные ГБ белых списков (фиксированные).
+    Возвращает id подписки (None — панель не ответила).
     """
     await database.increment_referral_activated(referrer_id)
     base_username = f"tg{referrer_id}_1"
-    referrer_base = next(
-        (s for s in await database.get_user_subscriptions(referrer_id) if s['username_in_panel'] == base_username),
-        None
-    )
+    referrer_sub = await database.get_user_main_subscription(referrer_id)
     base_id = None
-    if referrer_base:
-        base_id = referrer_base['id']
-        new_expiry = await panel_api.extend_subscription_by_username(base_username, REFERRAL_BONUS_DAYS)
+    days_label = f"+{REFERRAL_BONUS_DAYS} дней"
+    if referrer_sub:
+        base_id = referrer_sub['id']
+        days = await tariffs.bonus_days(referrer_sub, REFERRAL_BONUS_DAYS)
+        if referrer_sub['tariff_type_id'] != tariffs.BASE_TARIFF_ID:
+            days_label = f"+{tariffs.days_text(timedelta(days=days))} тарифа {html.escape(referrer_sub['tariff_name'])}"
+        new_expiry = await panel_api.extend_subscription_by_username(referrer_sub['username_in_panel'], days)
         if new_expiry:
             await database.update_subscription_expiry(base_id, new_expiry)
     else:
@@ -113,7 +116,7 @@ async def grant(bot, panel_api, referrer_id: int, friend_name: str) -> Optional[
     await _send(bot, referrer_id, (
         f"🎁 <b>Ваш друг подключился к VPN!</b>\n\n"
         f"{html.escape(friend_name or 'Друг')} начал пользоваться VPN.\n"
-        f"Вам начислено <b>+{REFERRAL_BONUS_DAYS} дней</b> подписки{bonus}!"
+        f"Вам начислено <b>{days_label}</b> подписки{bonus}!"
     ))
     return base_id
 
@@ -156,7 +159,7 @@ async def _alert_shared_device(bot, reward: Dict[str, Any], devices: List[Dict[s
         f"Устройство: {labels}\n\n"
         f"<b>Пригласил:</b>\n{_user_line(referrer_id, infos.get(referrer_id, {}))}\n"
         f"<b>Приглашённый:</b>\n{_user_line(friend_id, infos.get(friend_id, {}))}\n\n"
-        f"Бонус начислен: +{REFERRAL_BONUS_DAYS} дней к <code>tg{referrer_id}_1</code>{bonus}. "
+        f"Бонус начислен: +{REFERRAL_BONUS_DAYS} дней (в днях Standart) к подписке пригласившего{bonus}. "
         f"Если это накрутка — заберите дни: /admin → ➖ Уменьшить дни подписки."
     ))
 

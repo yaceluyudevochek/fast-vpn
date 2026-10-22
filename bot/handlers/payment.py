@@ -52,13 +52,10 @@ async def choose_payment_method(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ План не найден", show_alert=True)
         return
 
-    # Проверяем, есть ли уже активная подписка этого типа
-    subscriptions = await db.get_user_subscriptions(user_id)
-    existing_sub = None
-    for sub in subscriptions:
-        if sub['tariff_type_id'] == plan['tariff_type_id'] and sub['status'] == 'ACTIVE':
-            existing_sub = sub
-            break
+    # Одна подписка на аккаунт: тот же тариф — продление, другой — смена тарифа при оплате
+    main_sub = await db.get_user_main_subscription(user_id)
+    existing_sub = main_sub if (main_sub and main_sub['tariff_type_id'] == plan['tariff_type_id']
+                                and main_sub['status'] == 'ACTIVE') else None
 
     # Определяем, лимитный это тариф
     is_unlimited = (plan['traffic_limit_bytes'] == 0)
@@ -104,6 +101,8 @@ async def choose_payment_method(callback: CallbackQuery, state: FSMContext):
         text += f"{E['info']} <b>Информация:</b> это тариф с ограничением по трафику.\n"
         text += "При исчерпании лимита доступ будет заблокирован до продления.\n\n"
 
+    from handlers.handlers import switch_note
+    text += await switch_note(main_sub, plan)
     text += f"Выбери способ оплаты"
 
     await show_screen(callback, "payment", text, keyboard)
@@ -149,12 +148,7 @@ async def process_payment_method(callback: CallbackQuery, state: FSMContext):
     # ==========================================================
     # ОПРЕДЕЛЯЕМ, ЕСТЬ ЛИ ПОДПИСКА (АКТИВНАЯ ИЛИ ИСТЕКШАЯ)
     # ==========================================================
-    subscriptions = await db.get_user_subscriptions(user_id)
-    existing_sub = None
-    for sub in subscriptions:
-        if sub['tariff_type_id'] == plan['tariff_type_id']:  # Любая подписка этого типа
-            existing_sub = sub
-            break
+    existing_sub = await db.get_user_main_subscription(user_id)   # одна подписка на аккаунт
 
     # Определяем действие
     if existing_sub:

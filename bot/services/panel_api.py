@@ -355,6 +355,14 @@ class PanelAPI:
             if not page or start >= response["response"].get("total", 0):
                 return users
 
+    async def update_user(self, username: str, **fields) -> bool:
+        """PATCH /api/users по username: любые поля (expireAt, hwidDeviceLimit, activeInternalSquads, ...)"""
+        response = await self._request("PATCH", "users", json={"username": username, **fields})
+        if response is not None and not response.get("error"):
+            return True
+        logger.error(f"❌ Failed to update {username}: {response}")
+        return False
+
     async def get_internal_squads(self) -> Optional[List[Dict[str, Any]]]:
         response = await self._request("GET", "internal-squads")
         if response and not response.get("error") and "response" in response:

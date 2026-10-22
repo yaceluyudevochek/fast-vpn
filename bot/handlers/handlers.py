@@ -15,6 +15,7 @@ from services.promo import normalize_code
 from services.subscription_link import reissue_subscription_link
 from services import whitelist
 from services import referrals
+from services import tariffs
 from database import referral_db
 from handlers.payment import router as payment_router
 from handlers.ui_screens import show_screen
@@ -222,13 +223,10 @@ async def render_select_plan(target, user_id: int, plan_id: int, state: FSMConte
     # Определяем, лимитный это тариф или безлимитный
     is_unlimited = (plan['traffic_limit_bytes'] == 0)
 
-    # Проверяем, есть ли уже активная подписка этого типа
-    subscriptions = await database.get_user_subscriptions(user_id)
-    existing_sub = None
-    for sub in subscriptions:
-        if sub['tariff_type_id'] == plan['tariff_type_id'] and sub['status'] == 'ACTIVE':
-            existing_sub = sub
-            break
+    # Одна подписка на аккаунт: тот же тариф — продление, другой — смена тарифа при оплате
+    main_sub = await database.get_user_main_subscription(user_id)
+    existing_sub = main_sub if (main_sub and main_sub['tariff_type_id'] == plan['tariff_type_id']
+                                and main_sub['status'] == 'ACTIVE') else None
 
     promo_code = await saved_promo_code(state)
     promo_check = await promo_check_for_state(state, user_id, plan)
@@ -260,6 +258,7 @@ async def render_select_plan(target, user_id: int, plan_id: int, state: FSMConte
             "• Счётчик трафика будет обнулён\n\n"
         )
 
+    text += await switch_note(main_sub, plan)
     text += f"Для оформления нажми «Оплатить»"
 
     await show_screen(target, "payment", text, keyboard)
@@ -284,10 +283,9 @@ async def renew_select_plan(callback: CallbackQuery):
         await callback.answer("❌ Тип тарифа не найден", show_alert=True)
         return
 
-    # Получаем подписку для отображения текущего статуса
-    subscription = await database.get_subscription(subscription_id)
+    # Получаем подписку для отображения текущего статуса (только свою)
+    subscription = await _own_subscription(callback, subscription_id)
     if not subscription:
-        await callback.answer("❌ Подписка не найдена", show_alert=True)
         return
 
     # Получаем актуальную информацию из API для форматирования даты
@@ -446,23 +444,18 @@ async def activate_trial(callback: CallbackQuery):
 
     await show_screen(callback, "buy", f"{E['clock']} Активирую пробный период...")
 
-    # Проверяем, есть ли уже базовая подписка (tg{user_id}_1)
+    # Одна подписка на аккаунт: если подписка уже есть — триал добавляет к ней 3 дня Standart,
+    # пересчитанные по коэффициенту в её тариф
     base_username = f"tg{user.id}_1"
-    existing_sub = None
-
-    # Ищем среди подписок пользователя базовую (с username = tg{user_id}_1)
-    for sub in subscriptions:
-        if sub['username_in_panel'] == base_username:
-            existing_sub = sub
-            break
+    existing_sub = await database.get_user_main_subscription(user.id)
 
     if existing_sub:
-        # Если базовая подписка уже есть - просто продлеваем на 3 дня
-        logger.info(f"Found existing base subscription for user {user.id}, extending by 3 days")
+        trial_days = await tariffs.bonus_days(existing_sub, 3)
+        logger.info(f"Found existing subscription for user {user.id}, extending by {trial_days:.2f} days (trial)")
 
         new_expiry = await panel_api.extend_subscription_by_username(
-            base_username,
-            3  # Добавляем 3 дня к существующей подписке
+            existing_sub['username_in_panel'],
+            trial_days
         )
 
         if new_expiry:
@@ -478,8 +471,8 @@ async def activate_trial(callback: CallbackQuery):
             formatted_date = msk_time.strftime("%d.%m.%Y %H:%M МСК")
 
             # Получаем ссылку
-            user_data = await panel_api.get_user_by_username(base_username)
-            link = user_data.get("subscriptionUrl")
+            user_data = await panel_api.get_user_by_username(existing_sub['username_in_panel'])
+            link = (user_data or {}).get("subscriptionUrl")
 
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [kb_button("subs", "Мои подписки", callback_data="my_subscriptions")],
@@ -488,7 +481,7 @@ async def activate_trial(callback: CallbackQuery):
 
             text = (
                 f"{E['check']} <b>Пробный период активирован!</b>\n\n"
-                f"{E['calendar']} К текущей подписке добавлено <b>+3 дня</b>\n"
+                f"{E['calendar']} К текущей подписке добавлено <b>+{tariffs.days_text(timedelta(days=trial_days))}</b>\n"
                 f"{E['calendar']} Новая дата окончания: <b>{formatted_date}</b>\n"
                 f"{E['link']} Ссылка для подключения:\n"
                 f"{link}"
@@ -579,6 +572,10 @@ async def my_subscriptions(callback: CallbackQuery):
         await callback.answer()
         return
 
+    if len(subscriptions) == 1:  # одна подписка на аккаунт — сразу открываем её
+        await _render_subscription(callback, await database.get_subscription(subscriptions[0]['id']))
+        return
+
     keyboard = []
     for sub in subscriptions:
         # Получаем актуальную информацию из API
@@ -604,12 +601,13 @@ async def my_subscriptions(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("view_sub_"))
 async def view_subscription(callback: CallbackQuery):
-    subscription_id = int(callback.data.split("_")[2])
+    subscription = await _own_subscription(callback, int(callback.data.split("_")[2]))
+    if subscription:
+        await _render_subscription(callback, subscription)
 
-    subscription = await database.get_subscription(subscription_id)
-    if not subscription:
-        await callback.answer("❌ Подписка не найдена", show_alert=True)
-        return
+
+async def _render_subscription(callback: CallbackQuery, subscription: dict):
+    subscription_id = subscription['id']
 
     # Получаем актуальную информацию из API
     info = await panel_api.format_subscription_info_by_short_uuid(subscription['short_uuid'])
@@ -667,12 +665,15 @@ async def view_subscription(callback: CallbackQuery):
         keyboard.append([kb_button("reset", "Сбросить лимит устройств", callback_data=f"reset_devices_{subscription_id}")])
         keyboard.append([kb_button("link", "Перевыпустить ссылку", callback_data=f"revoke_link_{subscription_id}")])
 
+    if len(await database.get_all_tariff_types()) > 1:
+        keyboard.append([kb_button("reset", "Сменить тариф", callback_data=f"switch_tariff_{subscription_id}")])
+
     keyboard.append([kb_button(
         "buy", "Продлить подписку",
         callback_data=f"renew_type_{subscription['tariff_type_id']}_{subscription_id}"
     )])
 
-    keyboard.append([kb_button("back", "Назад к списку", callback_data="my_subscriptions")])
+    keyboard.append([kb_button("home", "В меню", callback_data="back_to_main")])
 
     await show_screen(callback, "subs", text, InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
@@ -766,6 +767,132 @@ async def render_renew_plan(target, user_id: int, plan_id: int, subscription_id:
 
     await show_screen(target, "payment", text, keyboard)
     return None
+
+
+# ==========================================================
+# СМЕНА ТАРИФА (одна подписка на аккаунт, остаток не сгорает)
+# ==========================================================
+
+async def _tariff_line(tariff_type: dict) -> str:
+    line = f"{tariff_type['hwid_limit']} устройств"
+    if tariff_type.get('bs_limit_gb') and await whitelist.is_enabled():
+        line += f", белые списки {tariff_type['bs_limit_gb']} ГБ"
+    return line
+
+
+async def switch_note(subscription, plan: dict) -> str:
+    """Предупреждение на экране плана другого тарифа: что станет с текущей подпиской после оплаты"""
+    if not subscription or subscription['tariff_type_id'] == plan['tariff_type_id']:
+        return ""
+    pv = await tariffs.preview(subscription, plan['tariff_type_id'])
+    if not pv:
+        return ""
+    text = f"{E['repeat']} Сейчас у тебя тариф <b>{subscription['tariff_name']}</b>. После оплаты подписка перейдёт на <b>{plan['tariff_name']}</b>"
+    if pv.remaining_old.total_seconds() > 0:
+        text += (f": оставшиеся {tariffs.days_text(pv.remaining_old)} станут "
+                 f"<b>{tariffs.days_text(pv.remaining_new)}</b>, и к ним добавится {plan['days']} дней")
+    text += ". Ссылка подписки останется прежней.\n"
+    if pv.devices_reset:
+        text += f"{E['warn']} Устройств станет меньше — подключённые устройства будут сброшены.\n"
+    return text + "\n"
+
+
+@router.callback_query(F.data.startswith("switch_tariff_"))
+async def switch_tariff_menu(callback: CallbackQuery):
+    subscription = await _own_subscription(callback, int(callback.data.split("_")[2]))
+    if not subscription:
+        return
+    allowed, message = tariffs.can_switch(subscription)
+    if not allowed:
+        await callback.answer(message, show_alert=True)
+        return
+
+    lines, keyboard = [], []
+    for tariff_type in await database.get_all_tariff_types():
+        if tariff_type['id'] == subscription['tariff_type_id']:
+            continue
+        pv = await tariffs.preview(subscription, tariff_type['id'])
+        if not pv:
+            continue
+        lines.append(
+            f"• <b>{tariff_type['name']}</b> ({await _tariff_line(tariff_type)}): "
+            f"{tariffs.days_text(pv.remaining_old)} → <b>{tariffs.days_text(pv.remaining_new)}</b>"
+        )
+        keyboard.append([kb_button("tag", tariff_type['name'], callback_data=f"switch_to_{subscription['id']}_{tariff_type['id']}")])
+    if not keyboard:
+        await callback.answer("Других тарифов пока нет", show_alert=True)
+        return
+    keyboard.append([kb_button("back", "Назад к подписке", callback_data=f"view_sub_{subscription['id']}")])
+
+    text = (
+        f"{E['repeat']} <b>Смена тарифа</b>\n\n"
+        f"Сейчас: <b>{subscription['tariff_name']}</b>\n\n"
+        "Оставшиеся дни не сгорают: их стоимость переносится в новый тариф. "
+        "На более дорогом тарифе дней станет меньше, на более доступном — больше.\n\n"
+        + "\n".join(lines) +
+        "\n\nСмена бесплатная и применяется сразу, ссылка подписки остаётся прежней"
+    )
+    await show_screen(callback, "tariffs", text, InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("switch_to_"))
+async def switch_tariff_confirm(callback: CallbackQuery):
+    _, _, sub_id, type_id = callback.data.split("_")
+    subscription = await _own_subscription(callback, int(sub_id))
+    if not subscription:
+        return
+    pv = await tariffs.preview(subscription, int(type_id))
+    if not pv:
+        await callback.answer("❌ Тариф недоступен", show_alert=True)
+        return
+
+    text = (
+        f"{E['repeat']} <b>Перейти на {pv.new_type['name']}?</b>\n\n"
+        f"Сейчас: <b>{pv.old_type['name']}</b> — {await _tariff_line(pv.old_type)}, "
+        f"осталось <b>{tariffs.days_text(pv.remaining_old)}</b>\n"
+        f"Станет: <b>{pv.new_type['name']}</b> — {await _tariff_line(pv.new_type)}, "
+        f"осталось <b>{tariffs.days_text(pv.remaining_new)}</b>\n\n"
+    )
+    if pv.devices_reset:
+        text += (f"{E['warn']} В новом тарифе меньше устройств, поэтому все подключённые устройства будут сброшены — "
+                 f"подключи заново нужные (не больше {pv.new_type['hwid_limit']}).\n\n")
+    text += "Ссылка подписки останется прежней. Сменить тариф снова можно будет через сутки."
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [kb_button("confirm", "Сменить тариф", callback_data=f"switch_do_{sub_id}_{type_id}")],
+        [kb_button("back", "Назад", callback_data=f"switch_tariff_{sub_id}")]
+    ])
+    await show_screen(callback, "tariffs", text, keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("switch_do_"))
+async def switch_tariff_do(callback: CallbackQuery):
+    _, _, sub_id, type_id = callback.data.split("_")
+    subscription = await _own_subscription(callback, int(sub_id))
+    if not subscription:
+        return
+    allowed, message = tariffs.can_switch(subscription)
+    if not allowed:
+        await callback.answer(message, show_alert=True)
+        return
+
+    await show_screen(callback, "tariffs", f"{E['clock']} Меняю тариф...")
+    updated = await tariffs.switch(panel_api, subscription['id'], int(type_id))
+    back = InlineKeyboardMarkup(inline_keyboard=[[kb_button("subs", "Моя подписка", callback_data=f"view_sub_{sub_id}")]])
+    if not updated:
+        await show_screen(callback, "tariffs", f"{E['cross']} Не удалось сменить тариф. Попробуй позже или напиши в поддержку.", back)
+        await callback.answer()
+        return
+    expiry = datetime.fromisoformat(updated['subscription_expiry'].replace('Z', '+00:00')) + timedelta(hours=3)
+    await show_screen(callback, "tariffs", (
+        f"{E['check']} <b>Тариф изменён: {updated['tariff_name']}</b>\n\n"
+        f"{E['shield']} Устройств: <b>{updated['tariff_hwid_limit']}</b>\n"
+        f"{E['calendar']} Подписка действует до: <b>{expiry:%d.%m.%Y %H:%M} МСК</b>\n\n"
+        "Ссылка подписки прежняя — обнови подписку в приложении, чтобы подтянулись новые серверы"
+    ), back)
+    await callback.answer()
 
 
 # ==========================================================

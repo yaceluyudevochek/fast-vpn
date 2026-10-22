@@ -352,6 +352,35 @@ async def _m012_session_flags(db):
     """)
 
 
+async def _m013_one_subscription(db):
+    """
+    Одна подписка на аккаунт, смена тарифа с пересчётом остатка по коэффициенту.
+    Лишние подписки (у кого их несколько) переносим в архив: оставляем ту, что на активном
+    тарифе и с самой поздней датой окончания.
+    """
+    await _add_column(db, "tariff_types", "switch_coef", "REAL")         # NULL — цена 30-дневного плана
+    await _add_column(db, "subscriptions", "tariff_changed_at", "TIMESTAMP")
+    await db.execute("CREATE TABLE IF NOT EXISTS subscriptions_archive AS SELECT * FROM subscriptions WHERE 0")
+    await _add_column(db, "subscriptions_archive", "archived_at", "TIMESTAMP")
+    async with db.execute("""
+        SELECT s.id, s.telegram_id FROM subscriptions s JOIN tariff_types tt ON tt.id = s.tariff_type_id
+        WHERE s.telegram_id IN (SELECT telegram_id FROM subscriptions GROUP BY telegram_id HAVING COUNT(*) > 1)
+        ORDER BY s.telegram_id, tt.is_active DESC, s.subscription_expiry DESC, s.id DESC
+    """) as cursor:
+        rows = await cursor.fetchall()
+    kept = set()
+    for sub_id, telegram_id in rows:
+        if telegram_id not in kept:
+            kept.add(telegram_id)
+            continue
+        columns = [c for c in await _column_names(db, "subscriptions")]
+        await db.execute(f"""
+            INSERT INTO subscriptions_archive ({', '.join(columns)}, archived_at)
+            SELECT {', '.join(columns)}, CURRENT_TIMESTAMP FROM subscriptions WHERE id = ?
+        """, (sub_id,))
+        await db.execute("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -365,6 +394,7 @@ _MIGRATIONS = [
     (10, _m010_abuse),
     (11, _m011_referral_rewards),
     (12, _m012_session_flags),
+    (13, _m013_one_subscription),
 ]
 
 
@@ -609,6 +639,43 @@ async def get_subscription_by_short_uuid(short_uuid: str) -> Optional[Dict[str, 
                               """, (short_uuid,)) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+
+async def get_user_main_subscription(telegram_id: int) -> Optional[Dict[str, Any]]:
+    """Подписка пользователя (одна на аккаунт; если по старым данным их больше — самая поздняя по сроку)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+                "SELECT id FROM subscriptions WHERE telegram_id = ? ORDER BY subscription_expiry DESC, id DESC LIMIT 1",
+                (telegram_id,)) as cursor:
+            row = await cursor.fetchone()
+    return await get_subscription(row[0]) if row else None
+
+
+async def get_tariff_coefficient(tariff_type_id: int) -> Optional[float]:
+    """Коэффициент тарифа для пересчёта дней: поле switch_coef, иначе цена 30-дневного плана"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT switch_coef FROM tariff_types WHERE id = ?", (tariff_type_id,)) as cursor:
+            row = await cursor.fetchone()
+        if row and row[0]:
+            return float(row[0])
+        async with db.execute("""
+            SELECT price FROM tariff_plans WHERE tariff_type_id = ? AND is_active = 1
+            ORDER BY ABS(days - 30), id LIMIT 1
+        """, (tariff_type_id,)) as cursor:
+            row = await cursor.fetchone()
+        return float(row[0]) if row else None
+
+
+async def change_subscription_tariff(subscription_id: int, tariff_type_id: int, plan_id: int, expiry: str,
+                                     bs_paid_until: Optional[str]):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE subscriptions
+            SET tariff_type_id = ?, tariff_plan_id = ?, subscription_expiry = ?, bs_paid_until = ?,
+                tariff_changed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (tariff_type_id, plan_id, expiry, bs_paid_until, subscription_id))
+        await db.commit()
 
 
 async def get_user_subscription_by_tariff_type(telegram_id: int, tariff_type_id: int) -> Optional[Dict[str, Any]]:

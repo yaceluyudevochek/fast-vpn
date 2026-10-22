@@ -138,7 +138,9 @@ async def _gift_allowed(subscription_id: int, now: datetime) -> bool:
 
 async def _gift(panel_api, sub: Dict[str, Any]) -> bool:
     """Продлить подписку на подарочные дни и начислить бонусные ГБ белых списков"""
-    new_expiry = await panel_api.extend_subscription_by_username(sub["username_in_panel"], gift_days())
+    from services import tariffs
+    days = await tariffs.bonus_days(await db.get_subscription(sub["id"]), gift_days())   # дни Standart → дни тарифа
+    new_expiry = await panel_api.extend_subscription_by_username(sub["username_in_panel"], days)
     if not new_expiry:
         logger.error(f"Возврат клиентов: не удалось продлить {sub['username_in_panel']} в панели")
         return False

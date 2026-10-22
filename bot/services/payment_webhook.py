@@ -8,6 +8,7 @@ from database import db
 from database import promo_db
 from services.panel_api import PanelAPI
 from services import whitelist
+from services import tariffs
 from config.config import (
     PLATEGA_MERCHANT_ID,
     PLATEGA_SECRET_KEY,
@@ -181,21 +182,15 @@ async def handle_successful_payment(transaction) -> bool:
         # Определяем, лимитный это тариф или безлимитный
         is_unlimited = (plan['traffic_limit_bytes'] == 0)
 
-        # Ищем существующую подписку
-        existing_sub = None
-        if len(payload_parts) >= 5:
-            try:
-                subscription_id = int(payload_parts[4])
-                existing_sub = await db.get_subscription(subscription_id)
-            except (ValueError, IndexError):
-                pass
-
-        if not existing_sub:
-            subscriptions = await db.get_user_subscriptions(user_id)
-            for sub in subscriptions:
-                if sub['tariff_type_id'] == plan['tariff_type_id']:
-                    existing_sub = sub
-                    break
+        # Одна подписка на аккаунт: куплен план другого тарифа — сначала переводим подписку
+        # на этот тариф (остаток пересчитывается по коэффициенту), дальше — обычное продление
+        existing_sub = await db.get_user_main_subscription(user_id)
+        if existing_sub and existing_sub['tariff_type_id'] != plan['tariff_type_id']:
+            switched = await tariffs.switch(panel_api, existing_sub['id'], plan['tariff_type_id'])
+            if not switched:
+                logger.error(f"❌ Не удалось сменить тариф подписки {existing_sub['id']} перед продлением")
+                return False
+            existing_sub = switched
 
         if existing_sub:
             # ======================================================

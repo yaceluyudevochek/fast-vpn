@@ -244,6 +244,7 @@ async def admin_edit_type(callback: CallbackQuery):
         f"Описание: {tariff_type['description'] or 'нет'}\n"
         f"Полное описание: {'есть' if tariff_type.get('full_description') else 'нет'}\n"
         f"Белые списки: {str(tariff_type['bs_limit_gb']) + ' ГБ / 30 дней' if tariff_type.get('bs_limit_gb') else 'не входят'}\n"
+        f"Коэффициент смены тарифа: {tariff_type.get('switch_coef') or 'цена 30-дневного плана'}\n"
         f"Статус: {'✅ Активен' if tariff_type['is_active'] else '❌ Неактивен'}\n\n"
         f"Что хотите изменить?"
     )
@@ -255,6 +256,7 @@ async def admin_edit_type(callback: CallbackQuery):
         [InlineKeyboardButton(text="📄 Описание", callback_data=f"edit_type_field_{type_id}_description")],
         [InlineKeyboardButton(text="📋 Полное описание", callback_data=f"edit_type_field_{type_id}_full_description")],
         [InlineKeyboardButton(text="🛡 Лимит белых списков", callback_data=f"edit_type_field_{type_id}_bs_limit_gb")],
+        [InlineKeyboardButton(text="⚖️ Коэффициент смены тарифа", callback_data=f"edit_type_field_{type_id}_switch_coef")],
         [InlineKeyboardButton(
             text="🔄 Переключить статус",
             callback_data=f"toggle_type_{type_id}"
@@ -304,7 +306,8 @@ async def edit_type_field(callback: CallbackQuery, state: FSMContext):
         "hwid_limit": "лимит устройств",
         "description": "короткое описание (для кнопки, до ~40 символов)",
         "full_description": "полное описание (можно с форматированием, «-» — очистить)",
-        "bs_limit_gb": "лимит трафика на серверах белых списков, ГБ за 30 дней («-» — белые списки не входят в тариф)"
+        "bs_limit_gb": "лимит трафика на серверах белых списков, ГБ за 30 дней («-» — белые списки не входят в тариф)",
+        "switch_coef": "коэффициент для смены тарифа (обычно месячная цена, например 200; «-» — цена 30-дневного плана)"
     }
 
     if field not in field_names:
@@ -371,6 +374,7 @@ async def toggle_type_status(callback: CallbackQuery):
             f"Описание: {updated_type['description'] or 'нет'}\n"
             f"Полное описание: {'есть' if updated_type.get('full_description') else 'нет'}\n"
             f"Белые списки: {str(updated_type['bs_limit_gb']) + ' ГБ / 30 дней' if updated_type.get('bs_limit_gb') else 'не входят'}\n"
+            f"Коэффициент смены тарифа: {updated_type.get('switch_coef') or 'цена 30-дневного плана'}\n"
             f"Статус: {'✅ Активен' if updated_type['is_active'] else '❌ Неактивен'}\n\n"
             f"Что хотите изменить?"
         )
@@ -382,6 +386,7 @@ async def toggle_type_status(callback: CallbackQuery):
             [InlineKeyboardButton(text="📄 Описание", callback_data=f"edit_type_field_{type_id}_description")],
             [InlineKeyboardButton(text="📋 Полное описание", callback_data=f"edit_type_field_{type_id}_full_description")],
             [InlineKeyboardButton(text="🛡 Лимит белых списков", callback_data=f"edit_type_field_{type_id}_bs_limit_gb")],
+            [InlineKeyboardButton(text="⚖️ Коэффициент смены тарифа", callback_data=f"edit_type_field_{type_id}_switch_coef")],
             [InlineKeyboardButton(
                 text="🔄 Переключить статус",
                 callback_data=f"toggle_type_{type_id}"
@@ -760,6 +765,16 @@ async def process_field_edit(message: Message, state: FSMContext):
                 return
             # Переводим GB в байты
             value = int(value) * 1024 * 1024 * 1024
+    elif field == 'switch_coef':
+        if value == '-':
+            value = None  # по умолчанию — цена 30-дневного плана
+        else:
+            try:
+                value = float(value.replace(',', '.'))
+                assert value > 0
+            except (ValueError, AssertionError):
+                await message.answer("❌ Введите положительное число (например, 200) или '-'")
+                return
     elif field == 'bs_limit_gb':
         if value == '-':
             value = None  # белые списки не входят в тариф
@@ -799,6 +814,7 @@ async def process_field_edit(message: Message, state: FSMContext):
                     f"Описание: {tariff_type['description'] or 'нет'}\n"
                     f"Полное описание: {'есть' if tariff_type.get('full_description') else 'нет'}\n"
                     f"Белые списки: {str(tariff_type['bs_limit_gb']) + ' ГБ / 30 дней' if tariff_type.get('bs_limit_gb') else 'не входят'}\n"
+                    f"Коэффициент смены тарифа: {tariff_type.get('switch_coef') or 'цена 30-дневного плана'}\n"
                     f"Статус: {'✅ Активен' if tariff_type['is_active'] else '❌ Неактивен'}\n\n"
                     f"Что хотите изменить?"
                 )
@@ -811,6 +827,7 @@ async def process_field_edit(message: Message, state: FSMContext):
                     [InlineKeyboardButton(text="📄 Описание", callback_data=f"edit_type_field_{entity_id}_description")],
                     [InlineKeyboardButton(text="📋 Полное описание", callback_data=f"edit_type_field_{entity_id}_full_description")],
                     [InlineKeyboardButton(text="🛡 Лимит белых списков", callback_data=f"edit_type_field_{entity_id}_bs_limit_gb")],
+                    [InlineKeyboardButton(text="⚖️ Коэффициент смены тарифа", callback_data=f"edit_type_field_{entity_id}_switch_coef")],
                     [InlineKeyboardButton(
                         text="🔄 Переключить статус",
                         callback_data=f"toggle_type_{entity_id}"
