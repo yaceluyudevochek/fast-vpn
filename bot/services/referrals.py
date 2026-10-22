@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from config import config
 from database import abuse_db, referral_db
 from database import db as database
+from services import gifts
 from services import whitelist
 from services import tariffs
 
@@ -95,8 +96,6 @@ async def grant(bot, panel_api, referrer_id: int, friend_name: str) -> Optional[
     (создаём Standart, если подписки нет) и ГБ белых списков за эти дни.
     Возвращает id подписки (None — панель не ответила).
     """
-    await database.increment_referral_activated(referrer_id)
-    base_username = f"tg{referrer_id}_1"
     referrer_sub = await database.get_user_main_subscription(referrer_id)
     base_id = None
     days = REFERRAL_BONUS_DAYS
@@ -109,25 +108,11 @@ async def grant(bot, panel_api, referrer_id: int, friend_name: str) -> Optional[
         if new_expiry:
             await database.update_subscription_expiry(base_id, new_expiry)
     else:
-        tariff_type = await database.get_tariff_type(1)
-        plans = await database.get_tariff_plans(1)
-        if not tariff_type or not plans:
-            return None
         logger.info(f"Creating base subscription for referrer {referrer_id} with {REFERRAL_BONUS_DAYS} days")
-        new_user = await panel_api.create_user(
-            username=base_username,
-            telegram_id=referrer_id,
-            squad_id=tariff_type['squad_id'],
-            days=REFERRAL_BONUS_DAYS,
-            hwid_limit=tariff_type['hwid_limit'],
-            tag=f"U{referrer_id}_T1"[:16],
-            extra_squad_ids=await whitelist.squads_for_new_user(tariff_type)
-        )
-        if new_user:
-            base_id = await database.create_subscription(
-                referrer_id, 1, plans[0]['id'], new_user.get("shortUuid"), new_user.get("expireAt"),
-                base_username, trial=False
-            )
+        base_id = await gifts.create_base_subscription(panel_api, referrer_id, REFERRAL_BONUS_DAYS)
+        if base_id is None:
+            return None  # панель не ответила — повторим при следующей проверке
+    await database.increment_referral_activated(referrer_id)
 
     bonus = ""
     if base_id:

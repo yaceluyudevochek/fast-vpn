@@ -10,8 +10,10 @@ white-label и работает "из коробки" без какого-либ
 Telegram file_id кэшируется в памяти процесса.
 """
 
+import html
 import logging
 import os
+import re
 from typing import Optional, Union
 
 from aiogram.types import (
@@ -23,6 +25,12 @@ from aiogram.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+CAPTION_LIMIT = 1024  # подпись к картинке/видео в Telegram (считаются символы без HTML-разметки)
+
+
+def caption_len(text: str) -> int:
+    return len(html.unescape(re.sub(r"<[^>]+>", "", text)))
 
 _ASSETS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "images"

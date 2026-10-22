@@ -5,7 +5,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import html
 import logging
-import re
 from datetime import datetime, timedelta
 
 from services.panel_api import PanelAPI
@@ -20,7 +19,7 @@ from services import referrals
 from services import tariffs
 from database import referral_db
 from handlers.payment import router as payment_router
-from handlers.ui_screens import show_screen
+from handlers.ui_screens import CAPTION_LIMIT, caption_len as _caption_len, show_screen
 from handlers.ui_emoji import E, BTN, kb_button
 from handlers.promo_view import price_lines, promo_check_for_state, promo_row, saved_promo_code
 
@@ -36,13 +35,6 @@ panel_api = PanelAPI(PANEL_API_URL, PANEL_API_KEY)
 def _expiry_of(subscription: dict):
     value = subscription.get('subscription_expiry')
     return datetime.fromisoformat(value.replace('Z', '+00:00')) if value else None
-
-
-CAPTION_LIMIT = 1024  # подпись к картинке в Telegram (считаются символы без HTML-разметки)
-
-
-def _caption_len(text: str) -> int:
-    return len(html.unescape(re.sub(r"<[^>]+>", "", text)))
 
 
 def _description_block(tariff_type: dict, rest: str) -> str:

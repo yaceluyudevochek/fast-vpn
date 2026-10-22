@@ -404,6 +404,22 @@ async def _m015_whitelist_gb_per_day(db):
     """)
 
 
+async def _m016_mailing_gifts(db):
+    """Подарок дней вместе с рассылкой: кому и сколько начислено (повторно в той же рассылке не начисляем)"""
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS mailing_gifts (
+            mailing_id TEXT NOT NULL,
+            telegram_id INTEGER NOT NULL,
+            subscription_id INTEGER,
+            days INTEGER,                                -- в днях тарифа подписки
+            bs_bytes INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',      -- pending, granted
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (mailing_id, telegram_id)
+        )
+    """)
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -420,6 +436,7 @@ _MIGRATIONS = [
     (13, _m013_one_subscription),
     (14, _m014_trial_by_device),
     (15, _m015_whitelist_gb_per_day),
+    (16, _m016_mailing_gifts),
 ]
 
 
@@ -861,6 +878,12 @@ async def get_all_users():
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT telegram_id FROM users") as cursor:
             return await cursor.fetchall()
+
+
+async def get_banned_ids() -> set:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT telegram_id FROM users WHERE role = 'banned'") as cursor:
+            return {row[0] for row in await cursor.fetchall()}
 
 
 MAILING_AUDIENCES = {

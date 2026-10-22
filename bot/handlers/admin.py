@@ -8,12 +8,15 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 import asyncio
 import logging
+import uuid
 
 from database import db as database
 from database.db import get_all_users, DB_PATH
 from services.panel_api import PanelAPI
 from services.subscription_link import reissue_subscription_link
+from services import gifts
 from services import whitelist
+from handlers.ui_screens import CAPTION_LIMIT, caption_len
 from config.config import PANEL_API_URL, PANEL_API_KEY, ADMIN_ID
 
 router = Router()
@@ -44,6 +47,7 @@ class UnbanUser(StatesGroup):
 
 
 class Mailing(StatesGroup):
+    gift_days = State()
     content = State()
     confirm = State()
 
@@ -1427,26 +1431,98 @@ async def choose_mailing_audience(callback: CallbackQuery, state: FSMContext):
         await callback.answer("В этой группе пока нет пользователей", show_alert=True)
         return
 
-    await state.set_state(Mailing.content)
+    await state.clear()
     await state.update_data(audience=audience)
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 Без подарка", callback_data="mailing_gift_none")],
+        [InlineKeyboardButton(text="🎁 Подарить дни подписки", callback_data="mailing_gift_set")],
         [InlineKeyboardButton(text="❌ Отменить рассылку", callback_data="cancel_mailing")]
     ])
-
     await callback.message.edit_text(
         "📢 <b>Создание рассылки</b>\n\n"
         f"Получатели: <b>{database.MAILING_AUDIENCES[audience]}</b> — {len(recipients)} чел.\n\n"
-        "Отправьте сообщение для рассылки.\n\n"
-        "Поддерживаются:\n"
-        "• Текст с форматированием\n"
-        "• Фотография (1 шт)\n"
-        "• Видео\n"
-        "• Документы",
+        "Подарить получателям дни подписки вместе с рассылкой?\n\n"
+        "<i>Дни задаются в днях Standart: на других тарифах пересчитываются по коэффициенту, "
+        "ГБ белых списков начисляются за эти дни. Истёкшие подписки продлеваются от текущего момента, "
+        "тем, у кого подписки не было, создаётся Standart. Забаненным подарок не начисляется.</i>",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "mailing_gift_set")
+async def mailing_gift_set(callback: CallbackQuery, state: FSMContext):
+    if not await database.is_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет прав администратора", show_alert=True)
+        return
+    await state.set_state(Mailing.gift_days)
+    await callback.message.edit_text(
+        "🎁 Сколько дней подарить? Введите число дней Standart (1–365):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить рассылку", callback_data="cancel_mailing")]
+        ])
+    )
+    await callback.answer()
+
+
+@router.message(Mailing.gift_days)
+async def mailing_gift_days(message: Message, state: FSMContext):
+    if not await database.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if not text.isdigit() or not 1 <= int(text) <= gifts.MAX_DAYS:
+        await message.answer(f"❌ Введите целое число от 1 до {gifts.MAX_DAYS}")
+        return
+    days = int(text)
+    # Один id на рассылку: повторное «Отправить» этой же рассылки второй раз не начислит
+    await state.update_data(gift_days=days, mailing_id=uuid.uuid4().hex)
+    lines = [f"• {name}: +{days_} дн." + (f", +{whitelist.format_gb(gb)} ГБ БС" if gb else "")
+             for name, (days_, gb) in (await gifts.examples(days)).items()]
+    await message.answer(
+        f"🎁 Подарок: <b>{days} дн. Standart</b>. Получит подписка тарифа:\n" + "\n".join(lines),
+        parse_mode="HTML"
+    )
+    await _ask_mailing_content(message, state, edit=False)
+
+
+@router.callback_query(F.data == "mailing_gift_none")
+async def mailing_gift_none(callback: CallbackQuery, state: FSMContext):
+    if not await database.is_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет прав администратора", show_alert=True)
+        return
+    await state.update_data(gift_days=None, mailing_id=None)
+    await _ask_mailing_content(callback.message, state, edit=True)
+    await callback.answer()
+
+
+async def _ask_mailing_content(message: Message, state: FSMContext, edit: bool):
+    data = await state.get_data()
+    audience = data.get('audience', 'all')
+    recipients = await database.get_mailing_recipients(audience)
+    await state.set_state(Mailing.content)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить рассылку", callback_data="cancel_mailing")]
+    ])
+    gift = data.get('gift_days')
+    text = (
+        "📢 <b>Создание рассылки</b>\n\n"
+        f"Получатели: <b>{database.MAILING_AUDIENCES[audience]}</b> — {len(recipients)} чел.\n"
+        + (f"🎁 Подарок: <b>{gift} дн. Standart</b> (каждому допишем строку, сколько начислено ему)\n" if gift else "")
+        + "\nОтправьте сообщение для рассылки.\n\n"
+        "Поддерживаются:\n"
+        "• Текст с форматированием\n"
+        "• Фотография (1 шт)\n"
+        "• Видео\n"
+        "• Документы"
+    )
+    if edit:
+        await message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "cancel_mailing")
@@ -1583,8 +1659,11 @@ async def show_mailing_preview(message: Message, state: FSMContext):
 
     audience = data.get('audience', 'all')
     recipients_count = len(await database.get_mailing_recipients(audience))
+    gift = data.get('gift_days')
+    gift_text = (f"\n🎁 С подарком <b>{gift} дн. Standart</b> — каждому допишем строку вида "
+                 f"«🎁 Тебе начислено +{gift} дней подписки…»" if gift else "")
     await message.answer(
-        f"Подтвердите отправку: <b>{database.MAILING_AUDIENCES[audience]}</b> — {recipients_count} чел.",
+        f"Подтвердите отправку: <b>{database.MAILING_AUDIENCES[audience]}</b> — {recipients_count} чел.{gift_text}",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
@@ -1602,6 +1681,26 @@ async def restart_mailing(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+async def _send_mailing(bot, user_id: int, content: dict, extra: str = ""):
+    """Отправить сообщение рассылки; extra — персональная строка (подарок), дописывается в конец"""
+    kind = content['content_type']
+    if kind == 'text':
+        await bot.send_message(user_id, content['text'] + (f"\n\n{extra}" if extra else ""), parse_mode="HTML")
+        return
+    caption = content.get('caption') or ""
+    if extra and kind != 'video_note':
+        joined = f"{caption}\n\n{extra}" if caption else extra
+        if caption_len(joined) <= CAPTION_LIMIT:
+            caption, extra = joined, ""
+    if kind in ('photo', 'video', 'document', 'animation', 'voice'):
+        send = getattr(bot, f"send_{kind}")
+        await send(user_id, content['file_id'], caption=caption or None, parse_mode="HTML")
+    elif kind == 'video_note':
+        await bot.send_video_note(user_id, content['file_id'])
+    if extra:  # в подпись не влезло (или у кружочка подписи нет) — отдельным сообщением
+        await bot.send_message(user_id, extra, parse_mode="HTML")
+
+
 @router.callback_query(F.data == "confirm_mailing")
 async def confirm_mailing(callback: CallbackQuery, state: FSMContext, bot):
     if not await database.is_admin(callback.from_user.id):
@@ -1609,77 +1708,47 @@ async def confirm_mailing(callback: CallbackQuery, state: FSMContext, bot):
         return
 
     data = await state.get_data()
+    if 'content' not in data:  # повторное нажатие — рассылка уже идёт
+        await callback.answer("Рассылка уже отправляется", show_alert=True)
+        return
+    await state.clear()
     content = data['content']
+    gift_days, mailing_id = data.get('gift_days'), data.get('mailing_id')
 
     audience = data.get('audience', 'all')
     users = await database.get_mailing_recipients(audience)
+    banned = await database.get_banned_ids() if gift_days else set()
 
     total_users = len(users)
     if total_users == 0:
         await callback.message.edit_text("❌ Нет пользователей для рассылки")
-        await state.clear()
         return
 
     status_message = await callback.message.edit_text(
         f"📢 Начинаю рассылку ({database.MAILING_AUDIENCES[audience]})...\n"
         f"Всего пользователей: {total_users}\n"
-        f"Отправлено: 0/{total_users}"
+        + (f"🎁 Подарок: {gift_days} дн. Standart\n" if gift_days else "")
+        + f"Отправлено: 0/{total_users}"
     )
 
     sent = 0
     failed = 0
     blocked = 0
+    gifted = 0
+    gift_failed = []
 
     for user_id in users:
+        extra = ""
+        if gift_days and user_id not in banned:
+            gift = await gifts.grant(panel_api, mailing_id, user_id, gift_days)
+            if gift:
+                gifted += 1
+                extra = await gifts.gift_line(gift)
+            else:
+                gift_failed.append(user_id)
 
         try:
-            if content['content_type'] == 'text':
-                await bot.send_message(
-                    user_id,
-                    content['text'],
-                    parse_mode="HTML"
-                )
-            elif content['content_type'] == 'photo':
-                await bot.send_photo(
-                    user_id,
-                    content['file_id'],
-                    caption=content['caption'],
-                    parse_mode="HTML"
-                )
-            elif content['content_type'] == 'video':
-                await bot.send_video(
-                    user_id,
-                    content['file_id'],
-                    caption=content['caption'],
-                    parse_mode="HTML"
-                )
-            elif content['content_type'] == 'document':
-                await bot.send_document(
-                    user_id,
-                    content['file_id'],
-                    caption=content['caption'],
-                    parse_mode="HTML"
-                )
-            elif content['content_type'] == 'animation':
-                await bot.send_animation(
-                    user_id,
-                    content['file_id'],
-                    caption=content['caption'],
-                    parse_mode="HTML"
-                )
-            elif content['content_type'] == 'voice':
-                await bot.send_voice(
-                    user_id,
-                    content['file_id'],
-                    caption=content['caption'],
-                    parse_mode="HTML"
-                )
-            elif content['content_type'] == 'video_note':
-                await bot.send_video_note(
-                    user_id,
-                    content['file_id']
-                )
-
+            await _send_mailing(bot, user_id, content, extra)
             sent += 1
 
         except Exception as e:
@@ -1697,8 +1766,9 @@ async def confirm_mailing(callback: CallbackQuery, state: FSMContext, bot):
                     f"✅ Отправлено: {sent}\n"
                     f"❌ Ошибок: {failed}\n"
                     f"🚫 Заблокировали бота: {blocked}"
+                    + (f"\n🎁 Подарок начислен: {gifted}" if gift_days else "")
                 )
-            except:
+            except Exception:
                 pass
 
         await asyncio.sleep(0.05)
@@ -1707,19 +1777,27 @@ async def confirm_mailing(callback: CallbackQuery, state: FSMContext, bot):
         [InlineKeyboardButton(text="« Назад в админ-меню", callback_data="admin_back")]
     ])
 
+    gift_report = ""
+    if gift_days:
+        gift_report = f"• 🎁 Подарок начислен: {gifted}\n"
+        if gift_failed:
+            shown = ", ".join(f"<code>{uid}</code>" for uid in gift_failed[:20])
+            more = f" и ещё {len(gift_failed) - 20}" if len(gift_failed) > 20 else ""
+            gift_report += (f"• ⚠️ Не удалось начислить ({len(gift_failed)}): {shown}{more} — "
+                            f"добавьте дни вручную (/admin → ➕ Добавить дни)\n")
+
     await status_message.edit_text(
         f"📢 <b>Рассылка завершена!</b>\n\n"
         f"📊 Статистика:\n"
         f"• Всего пользователей: {total_users}\n"
         f"• ✅ Успешно отправлено: {sent}\n"
         f"• ❌ Ошибок отправки: {failed}\n"
-        f"• 🚫 Заблокировали бота: {blocked}\n\n"
+        f"• 🚫 Заблокировали бота: {blocked}\n"
+        f"{gift_report}\n"
         f"Рассылка выполнена за {sent + failed + blocked} сообщений.",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
-
-    await state.clear()
 
 
 # ======================================================
