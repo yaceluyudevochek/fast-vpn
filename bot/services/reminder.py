@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, Dict
+from typing import Optional
 import aiosqlite
 
 from aiogram import Bot
@@ -24,13 +24,12 @@ class SubscriptionReminder:
         self.check_interval = check_interval
         self.is_running = False
         self._task: Optional[asyncio.Task] = None
-        # Храним информацию об отправленных уведомлениях
-        self._sent_notifications: Dict[str, Dict] = {}
         self._last_whitelist_check = float("-inf")
         self._last_retention_check = float("-inf")
         self._last_abuse_check = float("-inf")
         self._last_referral_check = float("-inf")
         self._last_session_check = float("-inf")
+        self._last_monitor_check = float("-inf")
 
     async def start(self):
         if self.is_running:
@@ -80,7 +79,22 @@ class SubscriptionReminder:
                 await self._check_sessions()
             except Exception as e:
                 logger.error(f"Error in session IP check: {e}", exc_info=True)
+            try:
+                await self._check_ops()
+            except Exception as e:
+                logger.error(f"Error in backup/monitor check: {e}", exc_info=True)
             await asyncio.sleep(self.check_interval)
+
+    async def _check_ops(self):
+        """Ежедневный бэкап базы и оповещения админам о сбоях (раз в MONITOR_INTERVAL)"""
+        from services import ops
+
+        await ops.daily_backup(self.bot)
+        now = asyncio.get_running_loop().time()
+        if now - self._last_monitor_check < ops.monitor_interval():
+            return
+        self._last_monitor_check = now
+        await ops.monitor.check(self.bot, self.panel_api)
 
     async def _check_referrals(self):
         """Награды за друзей: начисляем, когда друг подключился (раз в REFERRAL_CHECK_INTERVAL)"""
@@ -259,21 +273,21 @@ class SubscriptionReminder:
             if is_active:
                 # Уведомление за 24 часа (один раз)
                 if 23 <= hours_left <= 25:
-                    if not self._was_notification_sent(notif_key, '24h'):
+                    if not await self._was_notification_sent(notif_key, '24h'):
                         await self._send_24h_reminder(telegram_id, expiry_date, tariff_name)
-                        self._mark_notification_sent(notif_key, '24h')
+                        await self._mark_notification_sent(notif_key, '24h')
 
                 # Уведомление за 1 час (один раз)
                 elif 0.9 <= hours_left <= 1.1:
-                    if not self._was_notification_sent(notif_key, '1h'):
+                    if not await self._was_notification_sent(notif_key, '1h'):
                         await self._send_1h_reminder(telegram_id, expiry_date, tariff_name)
-                        self._mark_notification_sent(notif_key, '1h')
+                        await self._mark_notification_sent(notif_key, '1h')
 
                 # Уведомление за 10 минут (один раз)
                 elif 0.15 <= hours_left <= 0.18:
-                    if not self._was_notification_sent(notif_key, '10min'):
+                    if not await self._was_notification_sent(notif_key, '10min'):
                         await self._send_10min_reminder(telegram_id, expiry_date, tariff_name)
-                        self._mark_notification_sent(notif_key, '10min')
+                        await self._mark_notification_sent(notif_key, '10min')
 
             # ======================================================
             # ЛОГИКА ДЛЯ ИСТЕКШИХ ПОДПИСОК (ТОЛЬКО ОДИН РАЗ)
@@ -282,79 +296,28 @@ class SubscriptionReminder:
                 # Подписка истекла - отправляем уведомление только один раз.
                 # Статус EXPIRED в БД персистентен и выставляется в тот же момент,
                 # что и отправка уведомления, поэтому он сам по себе надёжный
-                # признак "уже уведомляли" - в отличие от self._sent_notifications,
-                # которое живёт только в памяти процесса и обнуляется при рестарте бота.
+                # признак "уже уведомляли".
                 if current_status != 'EXPIRED':
                     await self._send_expired_reminder(telegram_id, expiry_date, tariff_name)
-                    self._mark_notification_sent(notif_key, 'expired')
+                    await self._mark_notification_sent(notif_key, 'expired')
 
                     # Обновляем статус в БД
                     await db.update_subscription_status(sub_id, 'EXPIRED')
                     logger.info(f"📝 Статус подписки {sub_id} изменен на EXPIRED")
 
-            # Очищаем старые записи (раз в день)
-            if now.hour == 3 and now.minute < 10:  # В 3 часа ночи
-                self._cleanup_old_notifications()
-
         except Exception as e:
             logger.error(f"Error processing subscription {sub_id}: {e}")
 
-    def _was_notification_sent(self, key: str, notif_type: str) -> bool:
-        """Проверяем, отправляли ли уже такое уведомление"""
-        if key not in self._sent_notifications:
-            return False
-        if notif_type not in self._sent_notifications[key]:
-            return False
+    async def _was_notification_sent(self, key: str, notif_type: str) -> bool:
+        """Отправляли ли уже такое уведомление (хранится в базе — переживает перезапуск бота)"""
+        # Напоминания до окончания (24h, 1h, 10min) — не повторять 48 часов: после продления
+        # следующее окончание наступит позже, и напоминание снова нужно
+        within = 48 * 3600 if notif_type in ('24h', '1h', '10min') else None
+        return await db.reminder_sent_within(key, notif_type, within)
 
-        sent_data = self._sent_notifications[key][notif_type]
-        sent_time = sent_data['time']
-
-        # Для активных уведомлений (24h, 1h, 10min) - не отправлять повторно
-        if notif_type in ['24h', '1h', '10min']:
-            # Если прошло больше 48 часов, можно отправить снова (на всякий случай)
-            return (datetime.now() - sent_time).total_seconds() < 48 * 3600
-
-        # Для уведомления об истечении - никогда не отправлять повторно
-        elif notif_type == 'expired':
-            return True  # Раз отправили - больше никогда
-
-        return False
-
-    def _mark_notification_sent(self, key: str, notif_type: str):
-        """Отмечаем, что уведомление отправлено"""
-        if key not in self._sent_notifications:
-            self._sent_notifications[key] = {}
-
-        self._sent_notifications[key][notif_type] = {
-            'time': datetime.now(),
-            'type': notif_type
-        }
-
+    async def _mark_notification_sent(self, key: str, notif_type: str):
+        await db.mark_reminder_sent(key, notif_type)
         logger.info(f"✅ Уведомление {notif_type} для {key} отмечено как отправленное")
-
-    def _cleanup_old_notifications(self):
-        """Очищаем старые записи (старше 30 дней)"""
-        now = datetime.now()
-        keys_to_remove = []
-
-        for key, notifications in self._sent_notifications.items():
-            types_to_remove = []
-            for notif_type, data in notifications.items():
-                # Удаляем записи старше 30 дней
-                if (now - data['time']).days > 30:
-                    types_to_remove.append(notif_type)
-
-            for notif_type in types_to_remove:
-                del notifications[notif_type]
-
-            if not notifications:
-                keys_to_remove.append(key)
-
-        for key in keys_to_remove:
-            del self._sent_notifications[key]
-
-        if keys_to_remove or types_to_remove:
-            logger.info(f"🧹 Очищено {len(keys_to_remove)} ключей и {len(types_to_remove)} типов уведомлений")
 
     # ======================================================
     # ОТПРАВКА УВЕДОМЛЕНИЙ

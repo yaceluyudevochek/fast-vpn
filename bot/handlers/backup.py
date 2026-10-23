@@ -10,15 +10,18 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from database.db import DB_PATH, is_admin
+from config import config
 from config.config import ADMIN_ID
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Папка для временных файлов бэкапов
-BACKUP_DIR = "/opt/vpnbot/backups"
-# Изменил на постоянную папку
-os.makedirs(BACKUP_DIR, exist_ok=True)
+# Папка бэкапов (ручных и ежедневных автоматических, см. services/ops.py)
+BACKUP_DIR = getattr(config, "BACKUP_DIR", "/opt/fastvpnbot/backups")
+try:
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+except PermissionError:  # тесты и локальный запуск без /opt/fastvpnbot
+    logger.warning(f"Нет доступа к папке бэкапов {BACKUP_DIR}")
 
 
 # ======================================================

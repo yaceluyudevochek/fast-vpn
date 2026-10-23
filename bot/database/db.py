@@ -420,6 +420,18 @@ async def _m016_mailing_gifts(db):
     """)
 
 
+async def _m017_reminder_notifications(db):
+    """Отправленные напоминания об окончании подписки — в базе, а не в памяти (не дублируются после перезапуска)"""
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS reminder_notifications (
+            notif_key TEXT NOT NULL,                     -- «telegram_id_subscription_id»
+            notif_type TEXT NOT NULL,                    -- 24h, 1h, 10min, expired
+            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (notif_key, notif_type)
+        )
+    """)
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -437,6 +449,7 @@ _MIGRATIONS = [
     (14, _m014_trial_by_device),
     (15, _m015_whitelist_gb_per_day),
     (16, _m016_mailing_gifts),
+    (17, _m017_reminder_notifications),
 ]
 
 
@@ -878,6 +891,35 @@ async def get_all_users():
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT telegram_id FROM users") as cursor:
             return await cursor.fetchall()
+
+
+async def reminder_sent_within(notif_key: str, notif_type: str, seconds: Optional[int]) -> bool:
+    """Отправлялось ли напоминание (за последние seconds секунд; None — когда-либо)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        query = "SELECT 1 FROM reminder_notifications WHERE notif_key = ? AND notif_type = ?"
+        params = [notif_key, notif_type]
+        if seconds is not None:
+            query += " AND sent_at > datetime('now', ?)"
+            params.append(f"-{int(seconds)} seconds")
+        async with db.execute(query, params) as cursor:
+            return await cursor.fetchone() is not None
+
+
+async def mark_reminder_sent(notif_key: str, notif_type: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO reminder_notifications (notif_key, notif_type, sent_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (notif_key, notif_type) DO UPDATE SET sent_at = CURRENT_TIMESTAMP
+        """, (notif_key, notif_type))
+        await db.commit()
+
+
+async def cleanup_reminders(older_than_days: int = 30) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("DELETE FROM reminder_notifications WHERE sent_at < datetime('now', ?)",
+                                  (f"-{int(older_than_days)} days",))
+        await db.commit()
+        return cursor.rowcount
 
 
 async def get_banned_ids() -> set:

@@ -27,6 +27,10 @@ from handlers.admin_abuse import router as admin_abuse_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+from services import ops  # noqa: E402
+
+ops.install_error_collector()   # ошибки из логов — админам (см. services/ops.py)
+
 
 async def init_web_server():
     """Инициализация веб-сервера для callback'ов"""
