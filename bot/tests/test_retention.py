@@ -146,7 +146,7 @@ async def test_trial_expired_promo_then_gift():
     bot, panel = FakeBot(), FakePanel()
 
     assert await run(bot, panel, NOW) == {"trial_expired:promo": 1}
-    assert "Пробный период закончился" in bot.sent[-1][1] and "150 ₽" in bot.sent[-1][1]
+    assert "Бесплатные дни закончились" in bot.sent[-1][1] and "150 ₽" in bot.sent[-1][1]
     assert await run(bot, panel, NOW + timedelta(hours=10)) == {}   # сутки не прошли
     assert await run(bot, panel, NOW + timedelta(hours=21)) == {"trial_expired:gift": 1}
     assert panel.extended == [("tg1_1", 3)]
