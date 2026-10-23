@@ -605,6 +605,91 @@ async def test_migration_gb_per_day():
     print("OK  миграция #15: ГБ за идущие неоплаченные дни (триал, бонусные дни после оплаченных), остальных не трогает")
 
 
+async def test_admin_reset():
+    """Админ обнулил трафик: лимит снова полный, исчерпание снято, бонусы закрытой квоты списаны, следующий период — как обычно"""
+    path = await fresh_db()
+    panel = FakePanel()
+    now = datetime.now(timezone.utc)
+    yesterday = now - timedelta(days=1)
+
+    # Оплачено, 50 ГБ: вчера 40, сегодня до обнуления 15 → 55 > 50, исчерпано, сквад снят
+    sid = await make_sub(path, 1, "a", anchor=now - timedelta(days=5), paid_until=now + timedelta(days=60))
+    panel.add("a", 101, squads=(STD, BS))
+    await db.add_bs_bonus(sid, 2 * GB)
+    await whitelist.check_all(panel, now - timedelta(hours=1))               # квота запомнена
+    panel.use(101, yesterday, 40); panel.use(101, now, 15)
+    result = await whitelist.check_all(panel, now)
+    assert [s["telegram_id"] for s in result.exhausted] == [1] and BS not in panel.squads("a")
+
+    assert await whitelist.admin_reset_traffic(panel, sid, now) == 55 * GB
+    s = await sub(sid)
+    q = whitelist.get_quota(s, now)
+    assert q.start == now.replace(microsecond=0) and "|reset:" in q.key and q.offset == 15 * GB
+    assert q.limit == 50 * GB and q.refresh_at == whitelist.current_period(s["bs_period_anchor"], now)[1]
+    assert state(path, sid) is None and BS in panel.squads("a")              # доступ вернулся сразу
+    assert s["bs_bonus_used"] == 0                                           # вчерашние 40 < 50 — бонусы не тронуты
+
+    # Сегодняшние 15 ГБ до обнуления не считаются, новые — считаются
+    raw = await panel.get_squad_user_usage_bytes(BS, 101, whitelist._day(q.start), whitelist._day(now))
+    assert whitelist.used_in(q, raw) == 0
+    panel.use(101, now, 5)
+    status = await whitelist.get_status(panel, await sub(sid))
+    assert status.used == 5 * GB and "осталось <b>45 из 50 ГБ</b>" in whitelist.status_text(status), \
+        whitelist.status_text(status)
+    result = await whitelist.check_all(panel, now + timedelta(minutes=5))
+    assert result.exhausted == [] and BS in panel.squads("a")
+
+    # Новый 30-дневный период — обнуление больше не действует, ключ обычный; трафик квоты с обнуления
+    # списывается из бонусов как обычно (минус потраченное до обнуления)
+    later = whitelist.current_period(s["bs_period_anchor"], now)[1] + timedelta(hours=1)
+    q2 = whitelist.get_quota(await sub(sid), later)
+    assert "|reset:" not in q2.key and q2.offset == 0 and q2.start == later - timedelta(hours=1)
+    await whitelist.check_all(panel, later)
+    assert (await sub(sid))["bs_quota_key"] == q2.key and (await sub(sid))["bs_bonus_used"] == 0
+
+    # Бонусы, потраченные сверх лимита до обнуления, списываются при обнулении
+    b = await make_sub(path, 2, "b", anchor=now - timedelta(days=5), paid_until=now + timedelta(days=60))
+    panel.add("b", 102)
+    await db.add_bs_bonus(b, 14 * GB)
+    await whitelist.check_all(panel, now - timedelta(hours=1))
+    panel.use(102, yesterday, 60)                                           # 10 ГБ сверх лимита — из бонусов
+    await whitelist.admin_reset_traffic(panel, b, now)
+    assert (await sub(b))["bs_bonus_used"] == 10 * GB
+
+    # «Отключено админом» обнуление не отменяет; «без лимита от админа» сохраняется
+    c = await make_sub(path, 3, "c", anchor=now - timedelta(days=5), paid_until=now + timedelta(days=60))
+    panel.add("c", 103)
+    assert await whitelist.admin_set_user_squad(panel, await sub(c), BS, False)
+    await whitelist.admin_reset_traffic(panel, c, now)
+    assert state(path, c) == "admin_off" and BS not in panel.squads("c")
+    d = await make_sub(path, 4, "d", anchor=now - timedelta(days=5), paid_until=now + timedelta(days=60))
+    panel.add("d", 104)
+    assert await whitelist.admin_set_user_squad(panel, await sub(d), BS, True)
+    await whitelist.admin_reset_traffic(panel, d, now)
+    s = await sub(d)
+    assert s["bs_state"] == "admin_on" and s["bs_state_period"] == whitelist.get_quota(s, now).key
+
+    # Неоплаченные дни: обычного лимита нет — обнуление бонусы не возвращает
+    e = await make_sub(path, 5, "e", anchor=now - timedelta(days=3))
+    panel.add("e", 105)
+    await db.add_bs_bonus(e, 5 * GB)
+    await whitelist.check_all(panel, now - timedelta(hours=1))
+    panel.use(105, yesterday, 6)
+    await whitelist.check_all(panel, now)
+    assert state(path, e) == "exhausted"
+    await whitelist.admin_reset_traffic(panel, e, now)
+    assert whitelist.get_quota(await sub(e), now).total == 0                 # 5 бонусных потрачены
+
+    # Выключенные БС или тариф без БС — ничего не делаем
+    p = await make_sub(path, 6, "p", type_id=2, paid_until=now + timedelta(days=60))
+    panel.add("p", 106)
+    assert await whitelist.admin_reset_traffic(panel, p, now) is None
+    await whitelist.set_enabled(False)
+    assert await whitelist.admin_reset_traffic(panel, sid, now) is None
+    print("OK  обнуление трафика БС админом: лимит снова полный, доступ возвращается сразу, трафик дня до обнуления не "
+          "считается, бонусы и решения админа сохраняются, следующий период — без изменений")
+
+
 async def main():
     await test_period_math()
     await test_disabled()
@@ -618,6 +703,7 @@ async def main():
     await test_status_text()
     await test_migration()
     await test_migration_gb_per_day()
+    await test_admin_reset()
 
 
 if __name__ == "__main__":

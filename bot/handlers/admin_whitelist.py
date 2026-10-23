@@ -247,6 +247,8 @@ async def _squads_card(subscription_id: int):
         mark = "✅" if squad["uuid"] in active else "▫️"
         label = f"{mark} {squad['name']}" + (" 🛡" if squad["uuid"] == bs_squad else "")
         rows.append([_btn(label, f"adm_sqt_{subscription_id}_{squad['uuid']}")])
+    if status and status.state != "admin_off":
+        rows.append([_btn("🔄 Обнулить трафик белых списков", f"adm_bsreset_{subscription_id}")])
     rows.append([_btn("« Назад", "admin_back")])
     if bs_squad:
         lines.append(
@@ -254,6 +256,48 @@ async def _squads_card(subscription_id: int):
             "включение админом действует без лимита до обновления лимита (новые 30 дней или оплата)."
         )
     return "\n".join(lines), _kb(rows)
+
+
+@router.callback_query(F.data.startswith("adm_bsreset_"))
+async def admin_bs_reset_ask(callback: CallbackQuery):
+    if not await _require_admin(callback):
+        return
+    subscription_id = int(callback.data.split("_")[2])
+    subscription = await database.get_subscription(subscription_id)
+    status = await whitelist.get_status(panel_api, subscription) if subscription else None
+    if not status:
+        await callback.answer("❌ Белые списки выключены или не входят в тариф", show_alert=True)
+        return
+    used = "нет данных" if status.used is None else f"{whitelist.format_gb(status.used)} ГБ"
+    await callback.message.edit_text(
+        f"🔄 <b>Обнулить трафик белых списков?</b>\n\n"
+        f"👤 <code>{subscription['telegram_id']}</code> · {subscription['tariff_name']}\n"
+        f"Потрачено в текущем лимите: <b>{used}</b> из {whitelist.format_gb(status.quota.limit)} ГБ\n\n"
+        f"Счётчик начнётся заново с этой минуты: доступен весь лимит "
+        f"{whitelist.format_gb(status.quota.limit)} ГБ до его обычного обновления. Бонусные ГБ не меняются. "
+        f"Если доступ был снят из-за лимита — вернётся сразу.",
+        reply_markup=_kb([[_btn("✅ Обнулить", f"adm_bsresetok_{subscription_id}")],
+                          [_btn("« Отмена", f"adm_sqsub_{subscription_id}")]]),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_bsresetok_"))
+async def admin_bs_reset_do(callback: CallbackQuery):
+    if not await _require_admin(callback):
+        return
+    subscription_id = int(callback.data.split("_")[2])
+    used = await whitelist.admin_reset_traffic(panel_api, subscription_id)
+    if used is None:
+        await callback.answer("❌ Не получилось: панель не ответила или белые списки не входят в тариф", show_alert=True)
+        return
+    logger.info(f"🔄 Админ {callback.from_user.id}: обнулил трафик БС подписки {subscription_id} "
+                f"(было {whitelist.format_gb(used)} ГБ)")
+    text, keyboard = await _squads_card(subscription_id)
+    await callback.message.edit_text(f"✅ Трафик белых списков обнулён (было {whitelist.format_gb(used)} ГБ)\n\n{text}",
+                                     reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer("✅ Обнулено")
 
 
 @router.callback_query(F.data.startswith("adm_sqsub_"))

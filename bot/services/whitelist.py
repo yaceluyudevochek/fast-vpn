@@ -23,6 +23,12 @@
 Лимит (квота + бонусы) исчерпан → сквад БС снимается до обновления квоты или новых бонусов.
 Глобальный выключатель (bot_settings.bs_enabled): выключено — бот никому не выдаёт сквад БС.
 
+Ручное обнуление админом (admin_reset_traffic): квота начинает считать трафик с момента обнуления
+(subscriptions.bs_reset_at) и получает новый ключ — как будто началась новая квота: снимается
+«исчерпано», заново работает предупреждение, бонусы закрытой квоты списываются как обычно.
+Статистика панели посуточная, поэтому потраченное в день обнуления до него (bs_reset_bytes)
+вычитается. С новым 30-дневным периодом или оплатой отметка обнуления перестаёт действовать сама.
+
 bs_state у подписки (bs_state_period — ключ квоты, к которой относится состояние):
   NULL       — по умолчанию: сквад есть, пока не исчерпан лимит;
   exhausted  — лимит исчерпан, сквад снят до смены квоты или новых бонусов;
@@ -104,6 +110,7 @@ class Quota:
     paid_until: Optional[datetime] = None
     bonus: int = 0                 # остаток бонусных байт (тратится сверх обычного лимита)
     upcoming_limit: Optional[int] = None   # больший лимит нового тарифа — со следующего периода
+    offset: int = 0                # обнуление админом: трафик дня обнуления до него, байты (вычитается)
 
     @property
     def total(self) -> Optional[int]:
@@ -114,6 +121,19 @@ class Quota:
     def refresh_is_full(self) -> bool:
         """Обновится ли лимит до полного (а не закончатся оплаченные дни раньше)"""
         return bool(self.paid and self.refresh_at and self.paid_until and self.refresh_at <= self.paid_until)
+
+
+def used_in(quota: Quota, raw: Optional[int]) -> Optional[int]:
+    """Трафик квоты по статистике панели (с начала дня старта) за вычетом потраченного до обнуления"""
+    return None if raw is None else max(0, raw - quota.offset)
+
+
+def _with_reset(subscription: Dict[str, Any], start: datetime, key: str) -> Tuple[datetime, str, int]:
+    """Если админ обнулил трафик внутри этой квоты — считать с момента обнуления, ключ квоты новый"""
+    reset_at = _parse_utc(subscription.get("bs_reset_at"))
+    if reset_at and start and reset_at >= start:
+        return reset_at, f"{key}|reset:{_sql_ts(reset_at)}", int(subscription.get("bs_reset_bytes") or 0)
+    return start, key, 0
 
 
 def bonus_left(subscription: Dict[str, Any]) -> int:
@@ -130,21 +150,22 @@ def get_quota(subscription: Dict[str, Any], now: Optional[datetime] = None) -> Q
 
     paid_until = _parse_utc(subscription.get("bs_paid_until"))
     if paid_until and now < paid_until:
-        start, refresh_at = current_period(subscription.get("bs_period_anchor"), now)
-        key = _key("paid", start)
+        period_start, refresh_at = current_period(subscription.get("bs_period_anchor"), now)
+        start, key, offset = _with_reset(subscription, period_start, _key("paid", period_start))
         # Тариф повысили посреди периода: больший лимит — только со следующего периода, иначе можно
         # «съездить» на день на дорогой тариф ради его месячного лимита белых списков
         upcoming = None
         recorded = subscription.get("bs_quota_limit")
         if subscription.get("bs_quota_key") == key and recorded is not None and int(recorded) < full:
             upcoming, full = full, int(recorded)
-        return Quota(full, True, start, key, refresh_at, paid_until, bonus, upcoming)
+        return Quota(full, True, start, key, refresh_at, paid_until, bonus, upcoming, offset)
 
     # Неоплаченные дни: своего лимита нет, тратятся бонусные ГБ (начислены за эти дни).
     # Трафик считается с конца оплаченного срока (или с начала подписки)
-    start = paid_until or _parse_utc(subscription.get("bs_period_anchor")) \
+    free_start = paid_until or _parse_utc(subscription.get("bs_period_anchor")) \
         or _parse_utc(subscription.get("created_at")) or now
-    return Quota(0, False, start, _key("free", start), None, paid_until, bonus)
+    start, key, offset = _with_reset(subscription, free_start, _key("free", free_start))
+    return Quota(0, False, start, key, None, paid_until, bonus, offset=offset)
 
 
 def format_gb(value: int) -> str:
@@ -180,11 +201,13 @@ async def _sync_quota(panel_api, subscription: Dict[str, Any], quota: Quota, pan
             used = await panel_api.get_squad_user_usage_bytes(squad_uuid(), panel_user_id, _day(old_start), _day(last_day))
             if used is None:
                 return None
+            used = max(0, used - int(subscription.get("bs_quota_offset") or 0))
             spent = min(bonus_left(subscription), max(0, used - int(old_limit)))
 
-    await db.close_bs_quota(subscription["id"], spent, quota.key, _sql_ts(quota.start), quota.limit)
+    await db.close_bs_quota(subscription["id"], spent, quota.key, _sql_ts(quota.start), quota.limit, quota.offset)
     subscription["bs_bonus_used"] = int(subscription.get("bs_bonus_used") or 0) + spent
     subscription["bs_quota_key"], subscription["bs_quota_limit"] = quota.key, quota.limit
+    subscription["bs_quota_offset"] = quota.offset
     if spent:
         logger.info(f"🛡 БС: подписка {subscription['id']} потратила {format_gb(spent)} ГБ бонусов в закрытой квоте {old_key}")
     quota.bonus = bonus_left(subscription)
@@ -239,9 +262,9 @@ async def get_status(panel_api, subscription: Dict[str, Any]) -> Optional[BsStat
     user_id = await _panel_user_id(panel_api, subscription)
     if user_id:
         quota = await _sync_quota(panel_api, subscription, quota, user_id) or quota
-        used = await panel_api.get_squad_user_usage_bytes(
+        used = used_in(quota, await panel_api.get_squad_user_usage_bytes(
             squad_uuid(), user_id, _day(quota.start), _day(datetime.now(timezone.utc))
-        )
+        ))
     return BsStatus(quota=quota, used=used, state=_effective_state(subscription, quota))
 
 
@@ -425,12 +448,44 @@ async def _apply_bonus(panel_api, subscription_id: int):
     if not user_id:
         return
     quota = await _sync_quota(panel_api, subscription, quota, user_id)
-    used = await panel_api.get_squad_user_usage_bytes(
+    used = used_in(quota, await panel_api.get_squad_user_usage_bytes(
         squad_uuid(), user_id, _day(quota.start), _day(datetime.now(timezone.utc))
-    ) if quota else None
+    )) if quota else None
     if used is not None and used < quota.total:
         await db.set_bs_state(subscription_id, None)
         await _add_squad(panel_api, subscription)
+
+
+async def admin_reset_traffic(panel_api, subscription_id: int, now: Optional[datetime] = None) -> Optional[int]:
+    """
+    Админ обнулил трафик БС подписки: лимит текущей квоты снова полный (бонусы — как были).
+    Возвращает, сколько было потрачено до обнуления (байты), None — БС выключены/не в тарифе или панель не ответила.
+    Решение «отключено админом» не меняется; «без лимита от админа» сохраняется на новую квоту.
+    """
+    if not await is_enabled():
+        return None
+    now = now or datetime.now(timezone.utc)
+    subscription = await db.get_subscription(subscription_id)
+    if not subscription:
+        return None
+    quota = get_quota(subscription, now)
+    user_id = await _panel_user_id(panel_api, subscription)
+    if quota.limit is None or not user_id:
+        return None
+    used_before = used_in(quota, await panel_api.get_squad_user_usage_bytes(squad_uuid(), user_id, _day(quota.start), _day(now)))
+    today = await panel_api.get_squad_user_usage_bytes(squad_uuid(), user_id, _day(now), _day(now))
+    if used_before is None or today is None:
+        return None
+    was_unlimited = _effective_state(subscription, quota) == "admin_on"
+
+    await db.set_bs_reset(subscription_id, _sql_ts(now), today)
+    subscription = await db.get_subscription(subscription_id)
+    new_quota = get_quota(subscription, now)
+    if was_unlimited:
+        await db.set_bs_state(subscription_id, "admin_on", new_quota.key)
+    await _ensure_squad(panel_api, subscription_id)   # закрыть старую квоту, вернуть сквад, если был снят
+    logger.info(f"🛡 БС: подписка {subscription_id} — трафик обнулён админом (было {format_gb(used_before)} ГБ)")
+    return used_before
 
 
 async def admin_set_user_squad(panel_api, subscription: Dict[str, Any], squad: str, enable: bool) -> bool:
@@ -554,7 +609,7 @@ async def _check_all(panel_api, now: Optional[datetime] = None) -> Optional[Chec
 
         used = 0 if user["id"] not in candidates else None
         if state != "admin_on" and user["id"] in candidates:
-            used = await panel_api.get_squad_user_usage_bytes(squad, user["id"], _day(quota.start), _day(now))
+            used = used_in(quota, await panel_api.get_squad_user_usage_bytes(squad, user["id"], _day(quota.start), _day(now)))
             if used is None:
                 if sub in restored:
                     restored.remove(sub)

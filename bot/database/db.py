@@ -432,6 +432,19 @@ async def _m017_reminder_notifications(db):
     """)
 
 
+async def _m018_whitelist_reset(db):
+    """
+    Ручное обнуление трафика БС админом: с какого момента считать трафик заново (bs_reset_at) и сколько
+    уже было потрачено в день обнуления до него (bs_reset_bytes — статистика панели посуточная).
+    bs_quota_offset — то же для отслеживаемой квоты (bs_quota_*), чтобы при её закрытии верно списать бонусы.
+    """
+    await _add_column(db, "subscriptions", "bs_reset_at", "TIMESTAMP")
+    await _add_column(db, "subscriptions", "bs_reset_bytes", "INTEGER")
+    await _add_column(db, "subscriptions", "bs_quota_offset", "INTEGER")
+    for column, definition in (("bs_reset_at", "TIMESTAMP"), ("bs_reset_bytes", "INTEGER"), ("bs_quota_offset", "INTEGER")):
+        await _add_column(db, "subscriptions_archive", column, definition)   # архив — те же колонки, что у подписок
+
+
 _MIGRATIONS = [
     (1, _m001_payment_activation),
     (2, _m002_tariff_full_description),
@@ -450,6 +463,7 @@ _MIGRATIONS = [
     (15, _m015_whitelist_gb_per_day),
     (16, _m016_mailing_gifts),
     (17, _m017_reminder_notifications),
+    (18, _m018_whitelist_reset),
 ]
 
 
@@ -1220,15 +1234,23 @@ async def take_bs_bonus(subscription_id: int, amount: int):
         await db.commit()
 
 
-async def close_bs_quota(subscription_id: int, bonus_spent: int, key: str, start: str, limit: int):
+async def close_bs_quota(subscription_id: int, bonus_spent: int, key: str, start: str, limit: int, offset: int = 0):
     """Квота сменилась: списать потраченные в закрытой квоте бонусы и запомнить новую квоту"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             UPDATE subscriptions
             SET bs_bonus_used = MIN(bs_bonus_bytes, bs_bonus_used + ?),
-                bs_quota_key = ?, bs_quota_start = ?, bs_quota_limit = ?
+                bs_quota_key = ?, bs_quota_start = ?, bs_quota_limit = ?, bs_quota_offset = ?
             WHERE id = ?
-        """, (int(bonus_spent), key, start, limit, subscription_id))
+        """, (int(bonus_spent), key, start, limit, int(offset), subscription_id))
+        await db.commit()
+
+
+async def set_bs_reset(subscription_id: int, reset_at: str, bytes_before: int):
+    """Админ обнулил трафик БС: считать заново с reset_at; bytes_before — потрачено в этот день до обнуления"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE subscriptions SET bs_reset_at = ?, bs_reset_bytes = ? WHERE id = ?",
+                         (reset_at, int(bytes_before), subscription_id))
         await db.commit()
 
 
