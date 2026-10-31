@@ -142,9 +142,14 @@ async def activate_transaction(transaction) -> bool:
                     await whitelist.on_payment(panel_api, transaction['telegram_id'], plan)
             except Exception as e:
                 logger.error(f"❌ Не удалось обновить период белых списков по транзакции {transaction_id}: {e}")
-            # Промокод считается применённым только после оплаты и активации подписки
+            # Промокод считается применённым только после оплаты и активации подписки — один раз на человека.
+            # Второй оплаченный счёт со скидкой по тому же коду (открыл два счёта до оплаты) не записываем,
+            # подписку уже активировали (деньги списаны) — сообщаем админам, чтобы решить вручную
             try:
-                await promo_db.record_redemption(transaction)
+                if transaction.get("promo_id") and not await promo_db.record_redemption(transaction):
+                    previous = await promo_db.get_redemption(transaction["promo_id"], transaction["telegram_id"])
+                    if previous and previous["transaction_id"] != transaction["transaction_id"]:
+                        await alert_repeat_promo(transaction, previous)
             except Exception as e:
                 logger.error(f"❌ Не удалось записать применение промокода по транзакции {transaction_id}: {e}")
         else:
@@ -473,6 +478,35 @@ async def handle_chargeback_payment(transaction):
 
     except Exception as e:
         logger.error(f"❌ Ошибка при уведомлении о chargeback: {e}")
+
+
+async def alert_repeat_promo(transaction: dict, previous: dict):
+    """Админам: второй оплаченный счёт со скидкой по промокоду, который этот человек уже применял"""
+    from aiogram import Bot
+    from config.config import TOKEN
+    from services.abuse import _broadcast
+
+    promo = await promo_db.get_promo(transaction["promo_id"]) or {}
+    row = await db.get_user(transaction["telegram_id"])
+    info = dict(row) if row else {}
+    username = f" (@{info['username']})" if info.get("username") else ""
+    original = int(transaction.get("original_amount") or transaction["amount"])
+    logger.warning(f"⚠️ Повторная оплата по промокоду {promo.get('code')}: {transaction['telegram_id']}, "
+                   f"транзакции {previous['transaction_id']} и {transaction['transaction_id']}")
+    bot = Bot(token=TOKEN)
+    try:
+        await _broadcast(bot, (
+            "⚠️ <b>Промокод оплачен повторно</b>\n\n"
+            f"Пользователь: <code>{transaction['telegram_id']}</code>{username}\n"
+            f"Промокод: <b>{promo.get('code', '?')}</b> (−{promo.get('discount_percent', '?')}%)\n\n"
+            f"Первая оплата: <code>{previous['transaction_id']}</code> — {previous['paid_amount']} ₽\n"
+            f"Вторая оплата: <code>{transaction['transaction_id']}</code> — {transaction['amount']} ₽ "
+            f"вместо {original} ₽\n\n"
+            "Человек открыл два счёта со скидкой и оплатил оба. Подписка по второй оплате активирована, "
+            f"в применения промокода она не записана. Недоплата: {original - int(transaction['amount'])} ₽."
+        ))
+    finally:
+        await bot.session.close()
 
 
 # В payment_webhook.py - функция notify_user_success

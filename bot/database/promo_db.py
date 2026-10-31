@@ -130,7 +130,8 @@ async def record_event(promo_id: int, telegram_id: int, event: str):
 async def record_redemption(transaction: Dict[str, Any]) -> bool:
     """
     Зафиксировать применение промокода по оплаченной и активированной транзакции.
-    Идемпотентно (transaction_id уникален). True — запись создана.
+    Идемпотентно (transaction_id уникален) и не больше одного применения на человека: проверка и вставка —
+    одним запросом, так что две одновременно оплаченные транзакции не запишутся обе. True — запись создана.
     """
     promo_id = transaction.get("promo_id")
     if not promo_id:
@@ -141,11 +142,34 @@ async def record_redemption(transaction: Dict[str, Any]) -> bool:
         cursor = await db.execute("""
             INSERT OR IGNORE INTO promo_redemptions
             (promo_id, telegram_id, transaction_id, plan_id, original_amount, paid_amount)
-            VALUES (?, ?, ?, ?, ?, ?)
+            SELECT ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (SELECT 1 FROM promo_redemptions WHERE promo_id = ? AND telegram_id = ?)
         """, (promo_id, transaction["telegram_id"], transaction["transaction_id"],
-              transaction.get("plan_id"), original, paid))
+              transaction.get("plan_id"), original, paid, promo_id, transaction["telegram_id"]))
         await db.commit()
         return cursor.rowcount == 1
+
+
+async def get_redemption(promo_id: int, telegram_id: int) -> Optional[Dict[str, Any]]:
+    """Применение промокода этим человеком (одно на человека) или None"""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+                "SELECT * FROM promo_redemptions WHERE promo_id = ? AND telegram_id = ?",
+                (promo_id, telegram_id)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def user_pending_with_promo(promo_id: int, telegram_id: int) -> int:
+    """Сколько у человека неоплаченных счетов (за последние PENDING_HOLD_MINUTES) с этим промокодом"""
+    async with _connect() as db:
+        async with db.execute(f"""
+            SELECT COUNT(*) FROM payment_transactions
+            WHERE promo_id = ? AND telegram_id = ? AND status = 'PENDING'
+              AND created_at >= datetime('now', '-{int(PENDING_HOLD_MINUTES)} minutes')
+        """, (promo_id, telegram_id)) as cursor:
+            return (await cursor.fetchone())[0]
 
 
 async def promo_report(promo_id: int) -> Dict[str, Any]:

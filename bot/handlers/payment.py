@@ -6,6 +6,7 @@ import logging
 from datetime import datetime
 
 from database import db
+from database import promo_db
 from services.platega_api import PlategaAPI
 from services.payment_webhook import activate_transaction
 from config.config import (
@@ -145,6 +146,12 @@ async def process_payment_method(callback: CallbackQuery, state: FSMContext):
 
     await callback.answer("⏳ Создаю платеж...")
 
+    # Скидка по промокоду — на одну оплату: если уже есть неоплаченный счёт с этим кодом, предупреждаем
+    promo_repeat_note = ""
+    if promo_id and await promo_db.user_pending_with_promo(promo_id, user_id):
+        promo_repeat_note = (f"\n{E['warn']} У тебя уже есть неоплаченный счёт с этим промокодом. "
+                             f"Скидка действует на одну оплату — оплати только один из счетов.\n")
+
     # ==========================================================
     # ОПРЕДЕЛЯЕМ, ЕСТЬ ЛИ ПОДПИСКА (АКТИВНАЯ ИЛИ ИСТЕКШАЯ)
     # ==========================================================
@@ -230,7 +237,8 @@ async def process_payment_method(callback: CallbackQuery, state: FSMContext):
             f"{E['money']} Сумма: <b>{amount} руб.</b>{discount_note}\n"
             f"{E['calendar']} Срок: <b>{plan['days']} дней</b>\n"
             f"{E['chart']} Трафик: <b>{traffic_text}</b>\n"
-            f"{E['clock']} Счёт действителен: <b>{expires_in}</b>\n\n"
+            f"{E['clock']} Счёт действителен: <b>{expires_in}</b>\n"
+            f"{promo_repeat_note}\n"
             f"Нажми кнопку ниже для оплаты — подписка активируется автоматически",
             keyboard
         )

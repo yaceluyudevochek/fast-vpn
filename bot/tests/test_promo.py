@@ -403,6 +403,70 @@ async def test_admin_flow():
     assert "Отчёт по промокоду TIKTOK67" in ui.sent[-1]
     print("OK  админка: создание рекламного кода по шагам с валидацией, выбор планов, завершение/возобновление, срок, лимит, список, отчёт")
 
+async def test_repeat_promo_invoices():
+    """Два счёта со скидкой до оплаты: предупреждение на втором, при оплате обоих — одно применение и алерт админам"""
+    path = await fresh_db()
+    add_user(path, 20)
+    await db.create_subscription(20, 1, 2, "s20", "2026-10-13T11:12:59.241Z", "tg20_1", trial=False)
+    rec = Recorder()
+    pay.show_screen = rec.show_screen
+    pw.panel_api = FakePanel()
+    pw.notify_user_success = noop
+    pw.notify_admin_error = rec.notify_admin_error
+    alerts = []
+
+    async def fake_alert(transaction, previous):
+        alerts.append((previous["transaction_id"], transaction["transaction_id"]))
+    pw.alert_repeat_promo = fake_alert
+
+    created = []
+
+    async def create_payment(**kwargs):
+        created.append(kwargs)
+        return {"transactionId": f"r{len(created)}", "redirect": "https://pay"}
+    pay.platega_api = SimpleNamespace(create_payment=create_payment)
+    promo_id = await promo_db.create_promo({"code": "ONCE", "discount_percent": 20}, [])
+
+    async def invoice():
+        state = make_state(20)
+        await state.update_data(promo_code="ONCE", plan_id=2)
+        await state.set_state(pay.PaymentMethod.selecting_method)
+        await pay.process_payment_method(FakeCallback(20, "payment_method_2"), state)
+        return rec.screens[-1]
+
+    first = await invoice()
+    assert "уже есть неоплаченный счёт" not in first
+    second = await invoice()                                   # передумал, открыл второй счёт
+    assert "уже есть неоплаченный счёт с этим промокодом" in second and created[-1]["amount"] == 200
+
+    def callback(txid):
+        return SimpleNamespace(
+            headers={"X-MerchantId": cfg.PLATEGA_MERCHANT_ID, "X-Secret": cfg.PLATEGA_SECRET_KEY},
+            json=lambda: _async({"id": txid, "amount": 200.0, "currency": "RUB", "status": "CONFIRMED",
+                                 "paymentMethod": 2, "payload": "20_2_x"}))
+
+    await pw.handle_platega_callback(callback("r1"))
+    assert await promo_db.count_redemptions(promo_id) == 1 and alerts == []
+    await pw.handle_platega_callback(callback("r2"))           # оплатил и второй
+    assert pw.panel_api.extend_calls == 2                      # деньги списаны — подписка продлена
+    assert await promo_db.count_redemptions(promo_id) == 1     # применение одно
+    assert alerts == [("r1", "r2")]
+    await pw.handle_platega_callback(callback("r2"))           # повторный callback — без второго алерта
+    assert alerts == [("r1", "r2")]
+
+    # После оплаты код этому человеку больше не применяется
+    assert (await check_promo("ONCE", 20, await db.get_tariff_plan(2))).message == promo_service.MSG_USED
+
+    # Атомарно: две разные транзакции одного человека — записывается только первая
+    for txid in ("z1", "z2"):
+        sql(path, "INSERT INTO payment_transactions (transaction_id, telegram_id, plan_id, amount, status, promo_id, original_amount) "
+                  "VALUES (?, 21, 1, 120, 'CONFIRMED', ?, 150)", (txid, promo_id))
+    results = await asyncio.gather(*[promo_db.record_redemption(await db.get_transaction(t)) for t in ("z1", "z2")])
+    assert sorted(results) == [False, True]
+    print("OK  промокод один раз на человека: второй счёт со скидкой — предупреждение, оплата обоих — одно применение "
+          "и алерт админам, запись атомарна")
+
+
 async def main():
     await test_discount_math()
     await test_check_promo()
@@ -410,6 +474,7 @@ async def main():
     await test_user_input_and_rate_limit()
     await test_ad_report()
     await test_admin_flow()
+    await test_repeat_promo_invoices()
 
 
 if __name__ == "__main__":
