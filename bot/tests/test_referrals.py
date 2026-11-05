@@ -36,8 +36,12 @@ class FakePanel:
         self.users[username] = {"id": uid, "username": username,
                                 "activeInternalSquads": [{"uuid": s} for s in squads]}
 
+    def connect(self, username):
+        """Человек подключился к серверу: панель записала первое подключение"""
+        self.users[username]["userTraffic"] = {"firstConnectedAt": "2026-10-20T10:00:00.000Z"}
+
     async def get_user_by_username(self, username):
-        return self.users.get(username)
+        return None if self.down else self.users.get(username)
 
     async def set_user_squads(self, username, squads):
         self.users[username]["activeInternalSquads"] = [{"uuid": s} for s in dict.fromkeys(squads)]
@@ -99,13 +103,17 @@ async def test_flow():
     assert (await referrals.process_pending(bot, panel))["granted"] == 0
     assert panel.extended == [] and (await db.get_subscription(base))["bs_bonus_bytes"] == 0
 
-    # Панель недоступна — ждём
+    # Добавил подписку в приложение (устройство есть), но к серверу не подключался — ещё не считается
     panel.devices[120] = [{"hwid": "F1", "platform": "Android"}]
+    assert (await referrals.process_pending(bot, panel))["granted"] == 0 and panel.extended == []
+
+    # Панель недоступна — ждём
+    panel.connect("tg20_1")
     panel.down = True
     assert (await referrals.process_pending(bot, panel))["granted"] == 0
     panel.down = False
 
-    # Подключился (появилось устройство) — +7 дней и ГБ за них (7 × 30 / 30 = 7), счётчик, сообщение, сквад БС
+    # Подключился к серверу — +7 дней и ГБ за них (7 × 30 / 30 = 7), счётчик, сообщение, сквад БС
     result = await referrals.process_pending(bot, panel)
     assert result == {"granted": 1, "shared_device": 0, "expired": 0}, result
     assert panel.extended == [("tg10_1", 7)] and (await db.get_subscription(base))["bs_bonus_bytes"] == 7 * GB
@@ -114,7 +122,7 @@ async def test_flow():
     assert BS in [s["uuid"] for s in panel.users["tg10_1"]["activeInternalSquads"]]
     assert (await referrals.process_pending(bot, panel))["granted"] == 0     # второй раз не начисляем
     assert sql(path, "SELECT status, note FROM referral_rewards")[0] == ("granted", None)
-    print("OK  награда за друга: ждёт подключения, начисляется один раз (+7 дней и +7 ГБ), сбой панели не теряет")
+    print("OK  награда за друга: ждёт подключения, только после реального подключения (устройства мало), один раз (+7 дней и +7 ГБ), сбой панели не теряет")
 
 
 async def test_shared_device_and_expiry():
@@ -131,6 +139,9 @@ async def test_shared_device_and_expiry():
 
     # Друг подключился с того же устройства — награда начислена, админам оповещение
     panel.devices[140] = [{"hwid": "SAME", "deviceModel": "iPhone 15", "platform": "iOS"}]
+    panel.connect("tg40_1")
+    # У второго устройство есть, а подключения нет — награда всё равно сгорит
+    panel.devices[150] = [{"hwid": "ONLY-ADDED"}]
     result = await referrals.process_pending(bot, panel)
     assert result["granted"] == 1 and result["shared_device"] == 1, result
     alert = next(t for c, t in bot.sent if c == ADMIN)
@@ -142,6 +153,12 @@ async def test_shared_device_and_expiry():
     # Второй друг так и не подключился — через 2 дня ещё ждём, через 3 дня награда сгорает
     assert (await referrals.process_pending(bot, panel, now=datetime.now(timezone.utc) + timedelta(days=2)))["expired"] == 0
     later = datetime.now(timezone.utc) + timedelta(days=3, hours=1)
+    # ...но если панель в этот момент не отвечает — лишние сутки: сбой не сжигает награду
+    panel.down = True
+    assert (await referrals.process_pending(bot, panel, now=later))["expired"] == 0
+    assert (await referrals.process_pending(bot, panel, now=later + timedelta(days=1)))["expired"] == 1
+    panel.down = False
+    sql(path, "UPDATE referral_rewards SET status = 'pending', note = NULL WHERE friend_id = 50")
     assert (await referrals.process_pending(bot, panel, now=later))["expired"] == 1
     assert sql(path, "SELECT status FROM referral_rewards WHERE friend_id = 50")[0][0] == "expired"
     assert len([e for e in panel.extended if e[0] == "tg30_1"]) == 1
@@ -151,6 +168,7 @@ async def test_shared_device_and_expiry():
     await friend_with_trial(path, panel, 70, 60, 170)
     await referrals.queue_reward(bot, 70, "Друг")
     panel.devices[170] = [{"hwid": "NEW"}]
+    panel.connect("tg70_1")
     await referrals.process_pending(bot, panel)
     created = (await db.get_user_subscriptions(60))[0]
     assert created["username_in_panel"] == "tg60_1" and created["bs_bonus_bytes"] == 7 * GB

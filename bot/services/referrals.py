@@ -4,8 +4,9 @@
 
 1. Друг активировал триал → награда в ожидании (referral_rewards, status = pending),
    пригласившему сообщаем, что бонус придёт после подключения друга.
-2. Фоновая проверка (раз в REFERRAL_CHECK_INTERVAL): «подключился» = у подписки друга в панели
-   появилось устройство (HWID — приложение передаёт его при первом получении подписки).
+2. Фоновая проверка (раз в REFERRAL_CHECK_INTERVAL): «подключился» = панель зафиксировала первое
+   подключение к серверу (userTraffic.firstConnectedAt, есть только после реального трафика).
+   Устройство (HWID) для этого не годится: приложение передаёт его уже при добавлении подписки.
    Тогда начисляем награду. Если устройство друга совпало с устройством пригласившего —
    награду всё равно начисляем, но сообщаем админам (дни можно забрать: /admin → Уменьшить дни).
 3. Не подключился за REFERRAL_WAIT_DAYS (3) дня — награда сгорает.
@@ -133,6 +134,20 @@ async def grant(bot, panel_api, referrer_id: int, friend_name: str) -> Optional[
 # 3. ФОНОВАЯ ПРОВЕРКА
 # ======================================================
 
+async def _has_connected(panel_api, telegram_id: int) -> Optional[bool]:
+    """Подключался ли человек к серверу хотя бы по одной подписке. None — панель не ответила."""
+    subscriptions = await database.get_user_subscriptions(telegram_id)
+    answered = False
+    for sub in subscriptions:
+        user = await panel_api.get_user_by_username(sub["username_in_panel"])
+        if not user:
+            continue
+        answered = True
+        if (user.get("userTraffic") or {}).get("firstConnectedAt"):
+            return True
+    return False if answered or not subscriptions else None
+
+
 async def _devices_of(panel_api, telegram_id: int) -> Optional[List[Dict[str, Any]]]:
     """Все HWID-устройства всех подписок пользователя в панели. None — панель не ответила."""
     devices = []
@@ -181,15 +196,20 @@ async def process_pending(bot, panel_api, now: Optional[datetime] = None) -> Dic
             await referral_db.set_status(reward["id"], "expired", "повторный триал на том же устройстве")
             result["expired"] += 1
             continue
-        friend_devices = await _devices_of(panel_api, reward["friend_id"])
-        if friend_devices is None:
-            continue  # панель не ответила — проверим в следующий раз
-        if not friend_devices:
+        connected = await _has_connected(panel_api, reward["friend_id"])
+        if not connected:
             created = _utc(reward["created_at"])
-            if created and now - created > timedelta(days=wait_days()):
+            # Панель не ответила — даём лишние сутки: сбой не должен сжигать награду
+            # (но и подписка, удалённая из панели, не должна висеть в ожидании вечно)
+            extra = timedelta(days=1) if connected is None else timedelta(0)
+            if created and now - created > timedelta(days=wait_days()) + extra:
                 await referral_db.set_status(reward["id"], "expired", "друг не подключился")
                 result["expired"] += 1
             continue
+
+        friend_devices = await _devices_of(panel_api, reward["friend_id"])
+        if friend_devices is None:
+            continue  # панель не ответила — проверим в следующий раз
 
         referrer_devices = await _devices_of(panel_api, reward["referrer_id"]) or []
         shared: Set[str] = {d["hwid"] for d in friend_devices} & {d["hwid"] for d in referrer_devices}
