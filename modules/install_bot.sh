@@ -118,6 +118,12 @@ WEBHOOK_PORT = ${webhook_port}
 AGREEMENT_URL = "${agreement_url}"
 PRIVACY_URL = "${privacy_url}"
 SUPPORT_URL = "${support_url}"
+
+# Необязательные настройки (все значения и описания: config/config.py.example)
+# Белые списки: UUID Internal Squad с серверами БС; пусто — функция выключена
+BS_SQUAD_UUID = ""
+# Ежедневный бэкап базы: копия приходит ADMIN_ID в Telegram
+BACKUP_DIR = "${bot_dir}/backups"
 EOF
     chmod 600 "$bot_dir/config/config.py"
     log_ok "config/config.py создан."
