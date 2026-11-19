@@ -4,7 +4,7 @@
 # Remnawave Panel + Subscription Page + Nodes + Telegram-бот (white-label).
 #
 # Первый запуск:
-#   curl -fsSL https://raw.githubusercontent.com/yaceluyudevochek/fast-vpn-business/main/install.sh -o install.sh
+#   curl -fsSL https://raw.githubusercontent.com/yaceluyudevochek/fast-vpn/main/install.sh -o install.sh
 #   sudo bash install.sh
 #
 # Повторный запуск (репозиторий уже склонирован в /opt/fast-vpn-business):
@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # обновляем его через git pull.
 # ---------------------------------------------------------------------------
 if [[ ! -d "$SCRIPT_DIR/modules" ]]; then
-    REPO_URL="${FASTVPN_REPO_URL:-https://github.com/yaceluyudevochek/fast-vpn-business}"
+    REPO_URL="${FASTVPN_REPO_URL:-https://github.com/yaceluyudevochek/fast-vpn}"
     CLONE_DIR="/opt/fast-vpn-business"
 
     if ! command -v git >/dev/null 2>&1; then

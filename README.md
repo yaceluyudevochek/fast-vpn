@@ -20,7 +20,7 @@
 На чистом сервере Ubuntu или Debian под root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yaceluyudevochek/fast-vpn-business/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/yaceluyudevochek/fast-vpn/main/install.sh -o install.sh
 sudo bash install.sh
 ```
 
